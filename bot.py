@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import random
+import time
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus, urlparse
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -1065,7 +1066,7 @@ async def on_startup(application):
     application.create_task(broadcast_restart_notice(application))
 
 # --- Main ---
-def main():
+def build_application():
     global application
     application = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
@@ -1093,8 +1094,22 @@ def main():
     application.add_handler(CallbackQueryHandler(send_video, pattern="^leakvideos$"))
     application.add_error_handler(error_handler)
 
-    logger.info("🚀 Bot is running...")
-    application.run_polling()
+    return application
+
+
+def main():
+    while True:
+        app = build_application()
+        try:
+            logger.info("🚀 Bot is running...")
+            app.run_polling(drop_pending_updates=True, poll_interval=0.5)
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by keyboard interrupt.")
+            break
+        except Exception:
+            logger.exception("Bot crashed, restarting in 5 seconds...")
+            time.sleep(5)
+            continue
 
 if __name__ == '__main__':
     main()
