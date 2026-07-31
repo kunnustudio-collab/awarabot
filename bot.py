@@ -43,10 +43,17 @@ settings_collection = db["settings"]
 # In-memory rename jobs keyed by admin user id
 rename_jobs = {}
 
-# Controls for interrupting a running /addall batch
-add_all_stop_event = asyncio.Event()
-add_all_is_running = False
-add_all_task = None
+# Batch import state for /addall and /stopaddall
+add_all_state = {
+    "active": False,
+    "task": None,
+    "stop_event": None,
+    "status_chat_id": None,
+    "status_message_id": None,
+}
+
+# Default behavior for /addall: run in background so normal bot use is not blocked.
+ADD_ALL_BACKGROUND_DEFAULT = True
 
 # --- Helper Functions ---
 async def add_user(user_id, full_name):
@@ -734,115 +741,6 @@ def parse_channel_link(link):
 
 
 # --- Admin Commands (No changes here) ---
-async def stop_addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global add_all_is_running, add_all_task
-    if update.message.from_user.id != ADMIN_ID:
-        return
-    if not add_all_is_running:
-        await update.message.reply_text("⚠️ No /addall batch is currently running.")
-        return
-
-    add_all_stop_event.set()
-    if add_all_task and not add_all_task.done():
-        add_all_task.cancel()
-    await update.message.reply_text("🛑 Stop requested. The current /addall batch is being interrupted.")
-
-async def run_add_all_videos(bot, chat_id, message_id, start_link, end_id, admin_id):
-    global add_all_is_running, add_all_task
-    add_all_stop_event.clear()
-    try:
-        chat_id, start_id = parse_channel_link(start_link)
-        if not chat_id or not start_id:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text="❌ Invalid channel link. Use a message link like https://t.me/c/1234567890/42 or https://t.me/ChannelName/42",
-                parse_mode='Markdown'
-            )
-            add_all_is_running = False
-            add_all_task = None
-            return
-
-        if start_id >= end_id:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text="❌ End ID must be > Start ID.",
-                parse_mode='Markdown'
-            )
-            add_all_is_running = False
-            add_all_task = None
-            return
-
-        status_text = f"🔄 Batch process started for **{start_id}** to **{end_id}**..."
-        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=status_text, parse_mode='Markdown')
-
-        added, skipped, failed = 0, 0, 0
-        total = end_id - start_id + 1
-        for i, mid in enumerate(range(start_id, end_id + 1)):
-            if add_all_stop_event.is_set():
-                break
-            try:
-                msg = await bot.forward_message(chat_id=admin_id, from_chat_id=chat_id, message_id=mid)
-                if msg.video:
-                    if await videos_collection.count_documents({"file_id": msg.video.file_id}) == 0:
-                        await videos_collection.insert_one({"file_id": msg.video.file_id})
-                        added += 1
-                    else:
-                        skipped += 1
-                else:
-                    failed += 1
-                await bot.delete_message(chat_id=admin_id, message_id=msg.message_id)
-            except Exception:
-                failed += 1
-            if i % 10 == 0 or i == total - 1:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=f"🔄 **Processing...** {i+1}/{total}\n✅ Added: {added} | ⏩ Skipped: {skipped} | ❌ Failed: {failed}",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-            try:
-                await asyncio.wait_for(add_all_stop_event.wait(), timeout=1.5)
-            except asyncio.TimeoutError:
-                pass
-
-        if add_all_stop_event.is_set():
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=f"🛑 **Batch Stopped!**\n\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**",
-                parse_mode='Markdown'
-            )
-        else:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=f"✅ **Batch Finished!**\n\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**",
-                parse_mode='Markdown'
-            )
-    except asyncio.CancelledError:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text="🛑 **Batch Stopped!**",
-            parse_mode='Markdown'
-        )
-    except Exception as exc:
-        logger.exception("Error in addall background task")
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=f"❌ Batch failed: {exc}",
-            parse_mode='Markdown'
-        )
-    finally:
-        add_all_is_running = False
-        add_all_task = None
-
 async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
@@ -871,57 +769,184 @@ async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Error in /add: {e}")
         await update.message.reply_text(f"❌ Failed to process video.\nError: {e}")
 
-async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global add_all_is_running, add_all_task
+async def _update_add_all_status(bot, status_chat_id, status_message_id, text):
+    if not status_chat_id or not status_message_id:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=status_chat_id,
+            message_id=status_message_id,
+            text=text,
+            parse_mode='Markdown'
+        )
+    except Exception:
+        pass
 
+async def run_add_all_videos(bot, chat_id, start_id, end_id, status_chat_id, status_message_id):
+    stop_event = asyncio.Event()
+    add_all_state.update({
+        "active": True,
+        "task": asyncio.current_task(),
+        "stop_event": stop_event,
+        "status_chat_id": status_chat_id,
+        "status_message_id": status_message_id,
+    })
+
+    added, skipped, failed = 0, 0, 0
+    total = end_id - start_id + 1
+
+    try:
+        for i, mid in enumerate(range(start_id, end_id + 1)):
+            if stop_event.is_set():
+                break
+            try:
+                msg = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=chat_id, message_id=mid)
+                if msg.video:
+                    if await videos_collection.count_documents({"file_id": msg.video.file_id}) == 0:
+                        await videos_collection.insert_one({"file_id": msg.video.file_id})
+                        added += 1
+                    else:
+                        skipped += 1
+                else:
+                    failed += 1
+                await bot.delete_message(chat_id=ADMIN_ID, message_id=msg.message_id)
+            except Exception:
+                failed += 1
+            if i % 10 == 0 or i == total - 1:
+                await _update_add_all_status(
+                    bot,
+                    status_chat_id,
+                    status_message_id,
+                    f"🔄 **Processing...** {i+1}/{total}\n✅ Added: {added} | ⏩ Skipped: {skipped} | ❌ Failed: {failed}"
+                )
+            if stop_event.is_set():
+                break
+            await asyncio.sleep(1.5)
+
+        if stop_event.is_set():
+            await _update_add_all_status(
+                bot,
+                status_chat_id,
+                status_message_id,
+                "⏹️ **Batch Stopped!**\n\nThe /addall process was interrupted by admin."
+            )
+        else:
+            await _update_add_all_status(
+                bot,
+                status_chat_id,
+                status_message_id,
+                f"✅ **Batch Finished!**\n\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**"
+            )
+    except asyncio.CancelledError:
+        await _update_add_all_status(
+            bot,
+            status_chat_id,
+            status_message_id,
+            "⏹️ **Batch Stopped!**\n\nThe /addall process was interrupted by admin."
+        )
+        raise
+    except Exception as e:
+        logger.exception("Error during /addall batch")
+        await _update_add_all_status(
+            bot,
+            status_chat_id,
+            status_message_id,
+            f"❌ **Batch Error**\n\n{e}"
+        )
+    finally:
+        if add_all_state.get("task") is asyncio.current_task():
+            add_all_state.update({
+                "active": False,
+                "task": None,
+                "stop_event": None,
+                "status_chat_id": None,
+                "status_message_id": None,
+            })
+
+async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
-    if add_all_is_running:
-        await update.message.reply_text("⚠️ An /addall batch is already running. Use /stopaddall first.")
+
+    background = ADD_ALL_BACKGROUND_DEFAULT
+    args = list(context.args)
+
+    if len(args) == 3 and args[-1].lower() in {"background", "bg", "true", "yes"}:
+        background = True
+        args = args[:-1]
+    elif len(args) == 3 and args[-1].lower() in {"foreground", "fg", "false", "no"}:
+        background = False
+        args = args[:-1]
+
+    if len(args) != 2:
+        await update.message.reply_text(
+            "❌ **Invalid Usage**\n\nUse: `/addall <start_link> <end_id> [background|foreground]`",
+            parse_mode='Markdown'
+        )
         return
 
-    add_all_stop_event.clear()
-    add_all_is_running = True
-
-    if len(context.args) != 2:
-        add_all_is_running = False
-        await update.message.reply_text("❌ **Invalid Usage**\n\nUse: `/addall <start_link> <end_id>`", parse_mode='Markdown')
+    if add_all_state.get("active") and add_all_state.get("task") and not add_all_state["task"].done():
+        await update.message.reply_text("⚠️ /addall is already running. Use /stopaddall to stop it.")
         return
 
-    start_link, end_id_str = context.args
+    start_link, end_id_str = args
     chat_id, start_id = parse_channel_link(start_link)
     if not chat_id or not start_id:
-        add_all_is_running = False
         await update.message.reply_text("❌ Invalid channel link. Use a message link like https://t.me/c/1234567890/42 or https://t.me/ChannelName/42", parse_mode='Markdown')
         return
 
     try:
         end_id = int(end_id_str)
+        if start_id >= end_id:
+            await update.message.reply_text("❌ End ID must be > Start ID.")
+            return
     except ValueError:
-        add_all_is_running = False
         await update.message.reply_text("❌ Invalid end ID.")
         return
 
-    if start_id >= end_id:
-        add_all_is_running = False
-        await update.message.reply_text("❌ End ID must be > Start ID.")
-        return
-
     status_message = await update.message.reply_text(
-        f"🔄 Batch process started for **{start_id}** to **{end_id}**...",
+        f"🔄 Batch process started for **{start_id}** to **{end_id}**...\n\nMode: **{'Background' if background else 'Foreground'}**",
         parse_mode='Markdown'
     )
-    add_all_task = asyncio.create_task(
-        run_add_all_videos(
+
+    if background:
+        task = context.application.create_task(
+            run_add_all_videos(
+                context.bot,
+                chat_id,
+                start_id,
+                end_id,
+                status_message.chat_id,
+                status_message.message_id,
+            )
+        )
+        add_all_state["task"] = task
+        await update.message.reply_text("✅ /addall is running in the background. You can keep using the bot.")
+    else:
+        await run_add_all_videos(
             context.bot,
+            chat_id,
+            start_id,
+            end_id,
             status_message.chat_id,
             status_message.message_id,
-            start_link,
-            end_id,
-            ADMIN_ID,
         )
-    )
-    await update.message.reply_text("▶️ Batch running in background. Use /stopaddall to stop it anytime.")
+
+async def stop_addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    if not add_all_state.get("active"):
+        await update.message.reply_text("ℹ️ No active /addall batch is running.")
+        return
+
+    stop_event = add_all_state.get("stop_event")
+    if stop_event is not None:
+        stop_event.set()
+
+    task = add_all_state.get("task")
+    if task is not None and not task.done():
+        task.cancel()
+
+    await update.message.reply_text("🛑 Stop requested for the current /addall batch.")
 
 async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id == ADMIN_ID:
