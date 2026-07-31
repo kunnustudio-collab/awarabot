@@ -1098,25 +1098,22 @@ def build_application():
 
 
 def main():
-    while True:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        app = build_application()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = build_application()
+    try:
+        logger.info("🚀 Bot is running...")
+        app.run_polling(drop_pending_updates=True, poll_interval=0.5, close_loop=False)
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by keyboard interrupt.")
+    except Exception:
+        logger.exception("Bot crashed.")
+        raise
+    finally:
         try:
-            logger.info("🚀 Bot is running...")
-            app.run_polling(drop_pending_updates=True, poll_interval=0.5, close_loop=False)
-        except KeyboardInterrupt:
-            logger.info("Bot stopped by keyboard interrupt.")
-            break
-        except Exception:
-            logger.exception("Bot crashed, restarting in 5 seconds...")
-            time.sleep(5)
-            continue
-        finally:
-            try:
-                loop.close()
-            except Exception as e:
-                logger.warning(f"Failed to close event loop: {e}")
+            loop.close()
+        except Exception as e:
+            logger.warning(f"Failed to close event loop: {e}")
 
 if __name__ == '__main__':
     main()
