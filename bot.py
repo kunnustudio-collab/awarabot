@@ -1056,10 +1056,14 @@ async def rename_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del rename_jobs[admin_id]
     await query.message.reply_text("Rename job cancelled.")
 
+
+async def on_startup(application):
+    application.create_task(broadcast_restart_notice(application))
+
 # --- Main ---
 def main():
     global application
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add", add_video))
@@ -1084,7 +1088,6 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_command_info, pattern="^admin_.*$"))
     application.add_handler(CallbackQueryHandler(send_video, pattern="^leakvideos$"))
 
-    application.create_task(broadcast_restart_notice(application))
     logger.info("🚀 Bot is running...")
     application.run_polling()
 
