@@ -43,6 +43,10 @@ settings_collection = db["settings"]
 # In-memory rename jobs keyed by admin user id
 rename_jobs = {}
 
+# Controls for interrupting a running /addall batch
+add_all_stop_event = asyncio.Event()
+add_all_is_running = False
+
 # --- Helper Functions ---
 async def add_user(user_id, full_name):
     existing = await users_collection.find_one({"_id": user_id})
@@ -729,6 +733,16 @@ def parse_channel_link(link):
 
 
 # --- Admin Commands (No changes here) ---
+async def stop_addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    if not add_all_is_running:
+        await update.message.reply_text("⚠️ No /addall batch is currently running.")
+        return
+
+    add_all_stop_event.set()
+    await update.message.reply_text("🛑 Stop requested. The current /addall batch will stop after the current item finishes.")
+
 async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
@@ -759,7 +773,13 @@ async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID: return
+    global add_all_is_running
+
+    add_all_stop_event.clear()
+    add_all_is_running = True
+
     if len(context.args) != 2:
+        add_all_is_running = False
         await update.message.reply_text("❌ **Invalid Usage**\n\nUse: `/addall <start_link> <end_id>`", parse_mode='Markdown')
         return
 
@@ -772,15 +792,19 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         end_id = int(end_id_str)
         if start_id >= end_id:
+            add_all_is_running = False
             await update.message.reply_text("❌ End ID must be > Start ID.")
             return
     except ValueError:
+        add_all_is_running = False
         await update.message.reply_text("❌ Invalid end ID.")
         return
     status_message = await update.message.reply_text(f"🔄 Batch process started for **{start_id}** to **{end_id}**...", parse_mode='Markdown')
     added, skipped, failed = 0, 0, 0
     total = end_id - start_id + 1
     for i, mid in enumerate(range(start_id, end_id + 1)):
+        if add_all_stop_event.is_set():
+            break
         try:
             msg = await context.bot.forward_message(chat_id=ADMIN_ID, from_chat_id=chat_id, message_id=mid)
             if msg.video:
@@ -793,8 +817,16 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if i % 10 == 0 or i == total - 1:
             try: await status_message.edit_text(f"🔄 **Processing...** {i+1}/{total}\n✅ Added: {added} | ⏩ Skipped: {skipped} | ❌ Failed: {failed}", parse_mode='Markdown')
             except Exception: pass
-        await asyncio.sleep(1.5)
-    await status_message.edit_text(f"✅ **Batch Finished!**\n\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**", parse_mode='Markdown')
+        try:
+            await asyncio.wait_for(add_all_stop_event.wait(), timeout=1.5)
+        except asyncio.TimeoutError:
+            pass
+
+    add_all_is_running = False
+    if add_all_stop_event.is_set():
+        await status_message.edit_text(f"🛑 **Batch Stopped!**\n\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**", parse_mode='Markdown')
+    else:
+        await status_message.edit_text(f"✅ **Batch Finished!**\n\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**", parse_mode='Markdown')
 
 async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id == ADMIN_ID:
@@ -1073,6 +1105,7 @@ def build_application():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add", add_video))
     application.add_handler(CommandHandler("addall", add_all_videos))
+    application.add_handler(CommandHandler("stopaddall", stop_addall))
     application.add_handler(CommandHandler("clean", clean_db))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("premium", premium))
