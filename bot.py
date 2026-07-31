@@ -1084,7 +1084,7 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_command_info, pattern="^admin_.*$"))
     application.add_handler(CallbackQueryHandler(send_video, pattern="^leakvideos$"))
 
-    asyncio.get_event_loop().create_task(broadcast_restart_notice(application))
+    application.create_task(broadcast_restart_notice(application))
     logger.info("🚀 Bot is running...")
     application.run_polling()
 
