@@ -1101,9 +1101,24 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     app = build_application()
+    port = int(os.environ.get("PORT", 8080))
+    webhook_base_url = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
     try:
         logger.info("🚀 Bot is running...")
-        app.run_polling(drop_pending_updates=True, poll_interval=0.5, close_loop=False)
+        if webhook_base_url:
+            webhook_url = f"{webhook_base_url.rstrip('/')}/{BOT_TOKEN}"
+            logger.info(f"Starting webhook on port {port} with URL {webhook_url}")
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=BOT_TOKEN,
+                webhook_url=webhook_url,
+                drop_pending_updates=True,
+                close_loop=False,
+            )
+        else:
+            logger.warning("WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL is not set. Falling back to polling mode.")
+            app.run_polling(drop_pending_updates=True, poll_interval=0.5, close_loop=False)
     except KeyboardInterrupt:
         logger.info("Bot stopped by keyboard interrupt.")
     except Exception:
