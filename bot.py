@@ -1057,6 +1057,10 @@ async def rename_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text("Rename job cancelled.")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error in Telegram handler", exc_info=context.error)
+
+
 async def on_startup(application):
     application.create_task(broadcast_restart_notice(application))
 
@@ -1087,6 +1091,7 @@ def main():
     application.add_handler(CallbackQueryHandler(rename_cancel_cb, pattern="^rename_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_command_info, pattern="^admin_.*$"))
     application.add_handler(CallbackQueryHandler(send_video, pattern="^leakvideos$"))
+    application.add_error_handler(error_handler)
 
     logger.info("🚀 Bot is running...")
     application.run_polling()
