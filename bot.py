@@ -385,67 +385,77 @@ async def broadcast_restart_notice(application):
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Determine user and chat_id from the context
-    if update.callback_query:
-        user = update.callback_query.from_user
-        chat_id = update.callback_query.message.chat_id
-        try:
-            await update.callback_query.message.delete()
-        except Exception:
-            pass
-    else:
-        user = update.effective_user
-        chat_id = update.effective_chat.id
-
-    if not await is_user_subscribed(context.bot, user.id):
-        keyboard = build_force_join_keyboard()
-        await context.bot.send_message(
-            chat_id,
-            "🚫 You must join all required channels before using this bot.",
-            reply_markup=keyboard
-        )
-        return
-
-    await add_user(user.id, user.full_name)
-    user_record = await get_user(user.id)
-    premium_status_text = get_premium_status_text(user_record)
-    keyboard_buttons = [
-        [InlineKeyboardButton("📁 𝐂𝐚𝐭𝐞𝐠𝐨𝐫𝐢𝐞𝐬", callback_data="categories")],
-        [InlineKeyboardButton("🧾 𝐇𝐞𝐥𝐩 / 𝐈𝐧𝐟𝐨", callback_data="help")],
-        [
-            InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/+Nij4Wp7jbYY0YTFl"),
-            InlineKeyboardButton("💬 𝐒𝐮𝐩𝐩𝐨𝐫𝐭", url="https://t.me/+cRKhXxI_zH5jMmM9")
-        ],
-        [InlineKeyboardButton("👨‍💻 𝐀𝐝𝐦𝐢𝐧", url="https://t.me/MeAwara")]
-    ]
-    if user.id == ADMIN_ID:
-        keyboard_buttons.insert(3, [InlineKeyboardButton("🛠️ Manage Bot", callback_data="admin_panel")])
-    keyboard = InlineKeyboardMarkup(keyboard_buttons)
-
+    user = None
+    chat_id = None
     try:
-        parts = WELCOME_IMAGE_LINK.strip("/").split("/")
-        from_chat_id = int("-100" + parts[-2])
-        message_id = int(parts[-1])
-        caption = (
-            f"👋 𝙒𝙚𝙡𝙘𝙤𝙢𝙚 {user.mention_html()}!\n\n"
-            "💎 𝙔𝙤𝙪’𝙫𝙚 𝙟𝙤𝙞𝙣𝙚𝙙 𝙖 𝙥𝙧𝙚𝙢𝙞𝙪𝙢 𝙫𝙞𝙙𝙚𝙤 𝙨𝙝𝙖𝙧𝙞𝙣𝙜 𝙗𝙤𝙩.\n\n"
-            f"{premium_status_text}\n\n"
-            "🎬 𝘿𝙞𝙨𝙘𝙤𝙫𝙚𝙧 𝙝𝙤𝙩 𝙫𝙞𝙙𝙚𝙤 𝙘𝙖𝙩𝙚𝙜𝙤𝙧𝙞𝙚𝙨, 𝙜𝙚𝙩 𝙖 𝙣𝙚𝙬 𝙫𝙞𝙙𝙚𝙤 𝙚𝙫𝙚𝙧𝙮 𝙢𝙞𝙣𝙪𝙩𝙚!\n\n"
-            "🔥 𝙐𝙨𝙚 𝙩𝙝𝙚 𝙢𝙚𝙣𝙪 𝙗𝙚𝙡𝙤𝙬 𝙩𝙤 𝙜𝙚𝙩 𝙨𝙩𝙖𝙧𝙩𝙚𝙙."
-        )
-        await context.bot.copy_message(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=keyboard)
-    except Exception as e:
-        logger.error(f"Error sending welcome image: {e}")
-        await context.bot.send_message(
-            chat_id,
-            f"👋 𝙒𝙚𝙡𝙘𝙤𝙢𝙚 {user.mention_html()}!\n\n"
-            "💎 𝙔𝙤𝙪’𝙫𝙚 𝙟𝙤𝙞𝙣𝙚𝙙 𝙖 𝙥𝙧𝙚𝙢𝙞𝙪𝙢 𝙫𝙞𝙙𝙚𝙤 𝙨𝙝𝙖𝙧𝙞𝙣𝙜 𝙗𝙤𝙩.\n\n"
-            f"{premium_status_text}\n\n"
-            "🎬 𝘿𝙞𝙨𝙘𝙤𝙫𝙚𝙧 𝙝𝙤𝙩 𝙫𝙞𝙙𝙚𝙤 𝙘𝙖𝙩𝙚𝙜𝙤𝙧𝙞𝙚𝙨, 𝙜𝙚𝙩 𝙖 𝙣𝙚𝙬 𝙫𝙞𝙙𝙚𝙤 𝙚𝙫𝙚𝙧𝙮 𝙢𝙞𝙣𝙪𝙩𝙚!\n\n"
-            "🔥 𝙐𝙨𝙚 𝙩𝙝𝙚 𝙢𝙚𝙣𝙪 𝙗𝙚𝙡𝙤𝙬 𝙩𝙤 𝙜𝙚𝙩 𝙨𝙩𝙖𝙧𝙩𝙚𝙙.",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+        # Determine user and chat_id from the context
+        if update.callback_query:
+            user = update.callback_query.from_user
+            chat_id = update.callback_query.message.chat_id
+            try:
+                await update.callback_query.message.delete()
+            except Exception:
+                pass
+        else:
+            user = update.effective_user
+            chat_id = update.effective_chat.id
+
+        if not await is_user_subscribed(context.bot, user.id):
+            keyboard = build_force_join_keyboard()
+            await context.bot.send_message(
+                chat_id,
+                "🚫 You must join all required channels before using this bot.",
+                reply_markup=keyboard
+            )
+            return
+
+        await add_user(user.id, user.full_name)
+        user_record = await get_user(user.id)
+        premium_status_text = get_premium_status_text(user_record)
+        keyboard_buttons = [
+            [InlineKeyboardButton("📁 𝐂𝐚𝐭𝐞𝐠𝐨𝐫𝐢𝐞𝐬", callback_data="categories")],
+            [InlineKeyboardButton("🧾 𝐇𝐞𝐥𝐩 / 𝐈𝐧𝐟𝐨", callback_data="help")],
+            [
+                InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/+Nij4Wp7jbYY0YTFl"),
+                InlineKeyboardButton("💬 𝐒𝐮𝐩𝐩𝐨𝐫𝐭", url="https://t.me/+cRKhXxI_zH5jMmM9")
+            ],
+            [InlineKeyboardButton("👨‍💻 𝐀𝐝𝐦𝐢𝐧", url="https://t.me/MeAwara")]
+        ]
+        if user.id == ADMIN_ID:
+            keyboard_buttons.insert(3, [InlineKeyboardButton("🛠️ Manage Bot", callback_data="admin_panel")])
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+        try:
+            parts = WELCOME_IMAGE_LINK.strip("/").split("/")
+            from_chat_id = int("-100" + parts[-2])
+            message_id = int(parts[-1])
+            caption = (
+                f"👋 𝙒𝙚𝙡𝙘𝙤𝙢𝙚 {user.mention_html()}!\n\n"
+                "💎 𝙔𝙤𝙪’𝙫𝙚 𝙟𝙤𝙞𝙣𝙚𝙙 𝙖 𝙥𝙧𝙚𝙢𝙞𝙪𝙢 𝙫𝙞𝙙𝙚𝙤 𝙨𝙝𝙖𝙧𝙞𝙣𝙜 𝙗𝙤𝙩.\n\n"
+                f"{premium_status_text}\n\n"
+                "🎬 𝘿𝙞𝙨𝙘𝙤𝙫𝙚𝙧 𝙝𝙤𝙩 𝙫𝙞𝙙𝙚𝙤 𝙘𝙖𝙩𝙚𝙜𝙤𝙧𝙞𝙚𝙨, 𝙜𝙚𝙩 𝙖 𝙣𝙚𝙬 𝙫𝙞𝙙𝙚𝙤 𝙚𝙫𝙚𝙧𝙮 𝙢𝙞𝙣𝙪𝙩𝙚!\n\n"
+                "🔥 𝙐𝙨𝙚 𝙩𝙝𝙚 𝙢𝙚𝙣𝙪 𝙗𝙚𝙡𝙤𝙬 𝙩𝙤 𝙜𝙚𝙩 𝙨𝙩𝙖𝙧𝙩𝙚𝙙."
+            )
+            await context.bot.copy_message(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id, caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        except Exception as e:
+            logger.error(f"Error sending welcome image: {e}")
+            await context.bot.send_message(
+                chat_id,
+                f"👋 𝙒𝙚𝙡𝙘𝙤𝙢𝙚 {user.mention_html()}!\n\n"
+                "💎 𝙔𝙤𝙪’𝙫𝙚 𝙟𝙤𝙞𝙣𝙚𝙙 𝙖 𝙥𝙧𝙚𝙢𝙞𝙪𝙢 𝙫𝙞𝙙𝙚𝙤 𝙨𝙝𝙖𝙧𝙞𝙣𝙜 𝙗𝙤𝙩.\n\n"
+                f"{premium_status_text}\n\n"
+                "🎬 𝘿𝙞𝙨𝙘𝙤𝙫𝙚𝙧 𝙝𝙤𝙩 𝙫𝙞𝙙𝙚𝙤 𝙘𝙖𝙩𝙚𝙜𝙤𝙧𝙞𝙚𝙨, 𝙜𝙚𝙩 𝙖 𝙣𝙚𝙬 𝙫𝙞𝙙𝙚𝙤 𝙚𝙫𝙚𝙧𝙮 𝙢𝙞𝙣𝙪𝙩𝙚!\n\n"
+                "🔥 𝙐𝙨𝙚 𝙩𝙝𝙚 𝙢𝙚𝙣𝙪 𝙗𝙚𝙡𝙤𝙬 𝙩𝙤 𝙜𝙚𝙩 𝙨𝙩𝙖𝙧𝙩𝙚𝙙.",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+    except Exception as exc:
+        logger.exception("Unhandled error in /start handler for user %s", getattr(user, 'id', None))
+        if chat_id is not None:
+            try:
+                await context.bot.send_message(chat_id, "⚠️ Bot is temporarily unavailable. Please try again in a moment.")
+            except Exception:
+                pass
 
 async def check_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1251,37 +1261,36 @@ def build_application():
 
 
 def main():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    app = build_application()
-    port = int(os.environ.get("PORT", 8080))
-    webhook_base_url = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
-    try:
-        logger.info("🚀 Bot is running...")
-        if webhook_base_url:
-            webhook_url = f"{webhook_base_url.rstrip('/')}/{BOT_TOKEN}"
-            logger.info(f"Starting webhook on port {port} with URL {webhook_url}")
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path=BOT_TOKEN,
-                webhook_url=webhook_url,
-                drop_pending_updates=True,
-                close_loop=False,
-            )
-        else:
-            logger.warning("WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL is not set. Falling back to polling mode.")
-            app.run_polling(drop_pending_updates=True, poll_interval=0.5, close_loop=False)
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by keyboard interrupt.")
-    except Exception:
-        logger.exception("Bot crashed.")
-        raise
-    finally:
+    while True:
+        app = build_application()
+        port = int(os.environ.get("PORT", 8080))
+        webhook_base_url = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
         try:
-            loop.close()
-        except Exception as e:
-            logger.warning(f"Failed to close event loop: {e}")
+            logger.info("🚀 Bot is running...")
+            if webhook_base_url:
+                webhook_url = f"{webhook_base_url.rstrip('/')}/{BOT_TOKEN}"
+                logger.info(f"Starting webhook on port {port} with URL {webhook_url}")
+                app.run_webhook(
+                    listen="0.0.0.0",
+                    port=port,
+                    url_path=BOT_TOKEN,
+                    webhook_url=webhook_url,
+                    drop_pending_updates=True,
+                    close_loop=False,
+                )
+            else:
+                logger.warning("WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL is not set. Falling back to polling mode.")
+                app.run_polling(drop_pending_updates=True, poll_interval=0.5, close_loop=False)
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by keyboard interrupt.")
+            break
+        except Exception:
+            logger.exception("Bot crashed. Restarting in 5 seconds...")
+            time.sleep(5)
+            continue
+        else:
+            logger.info("Bot loop exited. Restarting in 5 seconds...")
+            time.sleep(5)
 
 if __name__ == '__main__':
     main()
