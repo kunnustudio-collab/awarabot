@@ -34,11 +34,36 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # --- MongoDB Setup ---
-mongo_client = AsyncIOMotorClient(MONGO_URI)
+mongo_client = AsyncIOMotorClient(
+    MONGO_URI,
+    maxPoolSize=50,
+    minPoolSize=5,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=5000,
+    socketTimeoutMS=10000,
+    maxIdleTimeMS=45000
+)
 db = mongo_client["telegram_bot"]
 users_collection = db["users"]
 videos_collection = db["videos"]
 settings_collection = db["settings"]
+
+# In-memory video count cache to eliminate 9-second MongoDB Atlas scans
+cached_video_count = 0
+last_count_refresh = 0
+
+async def get_total_videos_count():
+    global cached_video_count, last_count_refresh
+    now = time.time()
+    if cached_video_count <= 0 or (now - last_count_refresh > 300):
+        try:
+            cached_video_count = await videos_collection.estimated_document_count()
+            last_count_refresh = now
+        except Exception:
+            if cached_video_count <= 0:
+                cached_video_count = await videos_collection.count_documents({})
+                last_count_refresh = now
+    return cached_video_count
 
 # In-memory rename jobs keyed by admin user id
 rename_jobs = {}
@@ -86,8 +111,8 @@ async def add_user(user_id, full_name):
             await users_collection.update_one({"_id": user_id}, {"$set": update_fields})
 
 async def get_random_video():
-    count = await videos_collection.count_documents({})
-    if count == 0:
+    count = await get_total_videos_count()
+    if count <= 0:
         return None
     skip = random.randint(0, count - 1)
     return await videos_collection.find_one({}, skip=skip)
@@ -203,59 +228,40 @@ def get_force_channel_join_url(channel):
     return f"https://t.me/{channel}"
 
 
-async def get_missing_force_channels(bot, user_id):
-    missing = []
-    for channel in FORCE_CHANNELS:
-        # For invite links and other formats, try multiple ways to resolve the chat
-        tried_success = False
-        candidates = []
+CHANNEL_ID_CACHE = {}
+
+async def check_channel_member(bot, user_id, channel):
+    chat_identifier = CHANNEL_ID_CACHE.get(channel)
+    if chat_identifier is None:
         try:
-            if channel.startswith(("http://", "https://")):
-                parsed = urlparse(channel)
-                path = parsed.path.lstrip('/')
-                # candidate forms: original URL, path, @path, https://t.me/path
-                candidates = [channel]
-                if path:
-                    candidates.append(path)
-                    if not path.startswith('+') and not path.startswith('@'):
-                        candidates.append(f"@{path}")
-                    candidates.append(f"https://t.me/{path}")
-            else:
-                # not a URL: try as given, and as @username
-                candidates = [channel]
-                if not channel.startswith('@') and not channel.startswith('+'):
-                    candidates.append(f"@{channel}")
-
-            for cand in candidates:
-                try:
-                    # First try to resolve the candidate to a Chat object (useful for invite links)
-                    chat_identifier = None
-                    try:
-                        chat = await bot.get_chat(cand)
-                        # If get_chat succeeds, use chat.id for membership check
-                        chat_identifier = chat.id
-                    except Exception:
-                        # get_chat failed for this candidate; fall back to using the raw candidate
-                        chat_identifier = None
-
-                    target_for_member = chat_identifier if chat_identifier is not None else cand
-                    member = await bot.get_chat_member(target_for_member, user_id)
-                    if member.status in ["member", "administrator", "creator"]:
-                        tried_success = True
-                        break
-                except (Forbidden, BadRequest):
-                    # user not a member or chat inaccessible for this candidate
-                    continue
-                except Exception:
-                    # unknown error for this candidate; try next
-                    continue
-
+            cand = channel
+            if not cand.startswith("@") and not cand.startswith("-100") and not cand.startswith("http"):
+                cand = f"@{cand}"
+            chat = await bot.get_chat(cand)
+            chat_identifier = chat.id
+            CHANNEL_ID_CACHE[channel] = chat_identifier
         except Exception:
-            # parsing or other error; fall through to mark missing
-            tried_success = False
+            chat_identifier = channel
 
-        if not tried_success:
-            missing.append(channel)
+    try:
+        member = await bot.get_chat_member(chat_identifier, user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            return channel, True
+    except (Forbidden, BadRequest):
+        return channel, False
+    except Exception:
+        return channel, False
+    return channel, False
+
+async def get_missing_force_channels(bot, user_id):
+    tasks = [check_channel_member(bot, user_id, ch) for ch in FORCE_CHANNELS]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    missing = []
+    for r in results:
+        if isinstance(r, tuple):
+            channel, is_member = r
+            if not is_member:
+                missing.append(channel)
     return missing
 
 async def is_user_subscribed(bot, user_id):
@@ -285,13 +291,34 @@ async def reset_watch_count_if_needed(user_id):
         )
 
 async def can_watch_video(user_id):
-    user = await refresh_premium_status(user_id)
+    user = await get_user(user_id)
     if user is None:
         return True
-    if user.get("unlimited_access") or is_premium_record(user):
+
+    # 1. Premium check
+    expiry = user.get("premium_expiry")
+    if expiry and isinstance(expiry, datetime):
+        if expiry > datetime.utcnow():
+            return True
+        else:
+            asyncio.create_task(users_collection.update_one(
+                {"_id": user_id},
+                {"$set": {"premium_expiry": None, "unlimited_access": False}}
+            ))
+            user["premium_expiry"] = None
+
+    if user.get("unlimited_access"):
         return True
-    await reset_watch_count_if_needed(user_id)
-    user = await get_user(user_id)
+
+    # 2. Daily reset check
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if user.get("last_reset_date") != today:
+        asyncio.create_task(users_collection.update_one(
+            {"_id": user_id},
+            {"$set": {"videos_watched_today": 0, "last_reset_date": today}}
+        ))
+        return True
+
     return user.get("videos_watched_today", 0) < FREE_VIDEOS_PER_DAY
 
 async def increment_video_watch(user_id):
@@ -342,6 +369,7 @@ async def send_broadcast_to_all(bot, source_message, text, reply_markup=None):
                 reply_markup=reply_markup
             )
             delivered += 1
+            await asyncio.sleep(0.04) # gentle rate-limiting (~25 msg/s) to prevent Telegram flood ban
         except Forbidden:
             blocked += 1
         except BadRequest as e:
@@ -365,6 +393,7 @@ async def send_broadcast_text_to_all(bot, text, reply_markup=None):
         try:
             await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
             delivered += 1
+            await asyncio.sleep(0.04) # gentle rate-limiting to prevent flood ban
         except Forbidden:
             blocked += 1
         except BadRequest as e:
@@ -377,11 +406,12 @@ async def send_broadcast_text_to_all(bot, text, reply_markup=None):
             failed += 1
     return delivered, blocked, failed
 
-async def broadcast_restart_notice(application):
-    await asyncio.sleep(3)
-    text = "Bot Started 💞"
-    delivered, blocked, failed = await send_broadcast_text_to_all(application.bot, text)
-    logger.info(f"Restart broadcast complete: delivered={delivered}, blocked={blocked}, failed={failed}")
+async def send_startup_log(bot):
+    try:
+        await bot.send_message(LOG_GROUP_ID, "🚀 *AwaraBot has started and is fully operational!*", parse_mode='Markdown')
+        logger.info("Startup notification sent to LOG_GROUP_ID.")
+    except Exception as e:
+        logger.warning(f"Could not send startup log to LOG_GROUP_ID: {e}")
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -390,10 +420,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Determine user and chat_id from the context
         if update.callback_query:
-            user = update.callback_query.from_user
-            chat_id = update.callback_query.message.chat_id
+            query = update.callback_query
+            user = query.from_user
+            chat_id = update.effective_chat.id
             try:
-                await update.callback_query.message.delete()
+                await query.answer()
+            except Exception:
+                pass
+            try:
+                if query.message:
+                    await query.message.delete()
             except Exception:
                 pass
         else:
@@ -472,21 +508,27 @@ async def check_joined(update: Update, context: ContextTypes.DEFAULT_TYPE):
         show_alert=True
     )
 
-# --- FIX: Updated categories_menu ---
+# --- Categories Menu ---
 async def categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    keyboard = [[InlineKeyboardButton("🎬 𝐋𝐞𝐚𝐤 𝐕𝐢𝐝𝐞𝐨𝐬", callback_data="leakvideos")]]
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    chat_id = update.effective_chat.id
+    keyboard = [
+        [InlineKeyboardButton("🎬 𝐋𝐞𝐚𝐤 𝐕𝐢𝐝𝐞𝐨𝐬", callback_data="leakvideos")],
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="start")]
+    ]
     
     try:
-        # Delete the old message (photo)
-        await query.message.delete()
+        if query.message:
+            await query.message.delete()
     except Exception as e:
         logger.info(f"Could not delete message in categories_menu: {e}")
     
-    # Send a new text message
     await context.bot.send_message(
-        chat_id=query.message.chat_id,
+        chat_id=chat_id,
         text="📂 𝐒𝐞𝐥𝐞𝐜𝐭 𝐚 𝐜𝐚𝐭𝐞𝐠𝐨𝐫𝐲:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -679,44 +721,58 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     user_id = query.from_user.id
+    chat_id = update.effective_chat.id
 
     if not await can_watch_video(user_id):
         await context.bot.send_message(
-            chat_id=user_id,
+            chat_id=chat_id,
             text=("🚫 Your daily free limit has ended.\n\n"
                   "You have watched today's free videos.\n\n"
                   "You are not a premium user. Buy premium to @MeAwara."),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💎 Buy Premium Subscription", callback_data="buy_premium")]
+                [InlineKeyboardButton("💎 Buy Premium Subscription", callback_data="buy_premium")],
+                [InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]
             ])
         )
         return
 
     video_data = await get_random_video()
     if not video_data:
-        await context.bot.send_message(user_id, "⚠️ No videos found in the database.")
+        await context.bot.send_message(chat_id, "⚠️ No videos found in the database.")
         return
 
     try:
         sent = await context.bot.send_video(
-            chat_id=user_id,
+            chat_id=chat_id,
             video=video_data['file_id'],
             caption="Save or forward this video now! ⏳ ये वीडियो 5 मिनट बाद हट जाएगी।",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Next Video", callback_data="leakvideos")]
+                [InlineKeyboardButton("▶️ Next Video", callback_data="leakvideos")],
+                [InlineKeyboardButton("📂 Categories", callback_data="categories"), InlineKeyboardButton("🔙 Back", callback_data="start")]
             ])
         )
         await increment_video_watch(user_id)
         try:
-            await query.message.delete()
+            if query.message:
+                await query.message.delete()
         except Exception as e:
             logger.info(f"Could not delete old menu message: {e}")
 
-        asyncio.create_task(delete_message_after_delay(context, user_id, sent.message_id, 300))
+        asyncio.create_task(delete_message_after_delay(context, chat_id, sent.message_id, 300))
     except Exception as e:
         logger.error(f"Error sending video: {e}")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Video send failed. Tap below to try next video:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ Try Next Video", callback_data="leakvideos")]
+            ])
+        )
 
 async def delete_message_after_delay(context, chat_id, message_id, delay):
     await asyncio.sleep(delay)
@@ -961,12 +1017,14 @@ async def stop_addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id == ADMIN_ID:
         await videos_collection.delete_many({})
+        global cached_video_count
+        cached_video_count = 0
         await update.message.reply_text("✅ All videos have been deleted.")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id == ADMIN_ID:
         total_users = await users_collection.count_documents({})
-        total_videos = await videos_collection.count_documents({})
+        total_videos = await get_total_videos_count()
         await update.message.reply_text(f"📊 **Stats**\n\n- Users: {total_users}\n- Videos: {total_videos}", parse_mode='Markdown')
 
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1224,8 +1282,78 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error in Telegram handler", exc_info=context.error)
 
 
+# --- Tornado Health Endpoint Patch (Keeps Render alive 24/7 with 200 OK) ---
+try:
+    import tornado.web
+    import telegram.ext._updater
+
+    class HealthHandler(tornado.web.RequestHandler):
+        def get(self):
+            self.set_status(200)
+            self.write({"status": "ok", "message": "AwaraBot is online and running fast!"})
+
+        def head(self):
+            self.set_status(200)
+
+    _orig_init = telegram.ext._updater.WebhookAppClass.__init__
+
+    def _custom_init(self, webhook_path: str, bot, update_queue, secret_token=None):
+        _orig_init(self, webhook_path, bot, update_queue, secret_token)
+        self.add_handlers(r".*", [
+            (r"/", HealthHandler),
+            (r"/health/?", HealthHandler),
+            (r"/ping/?", HealthHandler),
+        ])
+
+    telegram.ext._updater.WebhookAppClass.__init__ = _custom_init
+    logger.info("Attached /health handler to Tornado WebhookAppClass.")
+except Exception as e:
+    logger.warning(f"Could not patch Tornado WebhookAppClass: {e}")
+
+async def keep_alive_ping(base_url):
+    """Pings self every 9 minutes so free hosting like Render never spins down."""
+    await asyncio.sleep(30)
+    url = f"{base_url.rstrip('/')}/health"
+    logger.info(f"Keep-alive background task started for {url}")
+    import urllib.request
+    while True:
+        try:
+            await asyncio.sleep(540) # 9 minutes (Render shuts down after 15 min of no HTTP traffic)
+            req = urllib.request.Request(url, headers={'User-Agent': 'AwaraBot-KeepAlive/1.0'})
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=15))
+            logger.info("Keep-alive ping sent successfully (Render 24/7 active).")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Keep-alive ping warning: {e}")
+
+def start_polling_dummy_server(port):
+    """Runs a tiny HTTP server on port if running in polling mode on hosts requiring open ports."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import threading
+
+    class DummyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "ok", "mode": "polling"}')
+
+        def log_message(self, format, *args):
+            pass
+
+    server = HTTPServer(("0.0.0.0", port), DummyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Dummy health check server running on port {port} for polling mode.")
+    return server
+
 async def on_startup(application):
-    application.create_task(broadcast_restart_notice(application))
+    application.create_task(send_startup_log(application.bot))
+    base_url = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+    if base_url:
+        application.create_task(keep_alive_ping(base_url))
 
 # --- Main ---
 def build_application():
@@ -1266,7 +1394,7 @@ def main():
         port = int(os.environ.get("PORT", 8080))
         webhook_base_url = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
         try:
-            logger.info("🚀 Bot is running...")
+            logger.info("🚀 Bot is starting...")
             if webhook_base_url:
                 webhook_url = f"{webhook_base_url.rstrip('/')}/{BOT_TOKEN}"
                 logger.info(f"Starting webhook on port {port} with URL {webhook_url}")
@@ -1275,17 +1403,27 @@ def main():
                     port=port,
                     url_path=BOT_TOKEN,
                     webhook_url=webhook_url,
-                    drop_pending_updates=True,
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
                     close_loop=False,
                 )
             else:
                 logger.warning("WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL is not set. Falling back to polling mode.")
-                app.run_polling(drop_pending_updates=True, poll_interval=0.5, close_loop=False)
+                try:
+                    start_polling_dummy_server(port)
+                except Exception as e:
+                    logger.warning(f"Could not start dummy port server: {e}")
+                app.run_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                    poll_interval=0.5,
+                    close_loop=False,
+                )
         except KeyboardInterrupt:
             logger.info("Bot stopped by keyboard interrupt.")
             break
         except Exception:
-            logger.exception("Bot crashed. Restarting in 5 seconds...")
+            logger.exception("Bot encountered an error. Restarting in 5 seconds...")
             time.sleep(5)
             continue
         else:
