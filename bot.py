@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import html
 import random
 import time
 from datetime import datetime, timedelta
@@ -190,20 +191,20 @@ async def _debounced_auto_add_notify(bot, cat_key):
     if not data or data.get("count", 0) <= 0:
         return
     count = data["count"]
-    chat_title = data.get("chat_title", "Group")
-    cat_name = CATEGORIES.get(cat_key, {}).get("name", cat_key)
+    chat_title = html.escape(str(data.get("chat_title", "Group")))
+    cat_name = html.escape(str(CATEGORIES.get(cat_key, {}).get("name", cat_key)))
     total_cnt = category_counts_cache.get(cat_key, 0)
     try:
         await bot.send_message(
             chat_id=ADMIN_ID,
             text=(
-                f"📥 **Auto-Add Video Alert**\n\n"
-                f"✅ **{count}** new video{'s' if count > 1 else ''} automatically saved!\n"
-                f"📁 Category: **{cat_name}** (`{cat_key}`)\n"
-                f"📺 Source: **{chat_title}**\n"
-                f"🎬 Total in Category: **{total_cnt}** videos"
+                f"📥 <b>Auto-Add Video Alert</b>\n\n"
+                f"✅ <b>{count}</b> new video{'s' if count > 1 else ''} automatically saved!\n"
+                f"📁 Category: <b>{cat_name}</b> (<code>{html.escape(cat_key)}</code>)\n"
+                f"📺 Source: <b>{chat_title}</b>\n"
+                f"🎬 Total in Category: <b>{total_cnt}</b> videos"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e:
         logger.warning(f"Could not send auto-add alert: {e}")
@@ -1879,14 +1880,18 @@ async def user_submit_category_callback(update: Update, context: ContextTypes.DE
     )
 
     # Send video + review buttons to ADMIN_ID
-    user_handle = f"@{user.username}" if user.username else "No username"
+    user_handle = f"@{html.escape(user.username)}" if user.username else "No username"
+    u_name = html.escape(user.full_name or "User")
+    c_name = html.escape(cat_name)
+    c_key = html.escape(cat_key)
+
     admin_caption = (
-        f"📩 **New User Video Submission!**\n\n"
-        f"👤 **From:** {user.full_name} ({user_handle})\n"
-        f"🆔 **User ID:** `{user.id}`\n"
-        f"📁 **Requested Category:** **{cat_name}** (`{cat_key}`)\n"
-        f"🕒 **Time:** {datetime.utcnow().strftime('%d %b %Y, %H:%M UTC')}\n\n"
-        f"👇 *Review and choose action:*"
+        f"📩 <b>New User Video Submission!</b>\n\n"
+        f"👤 <b>From:</b> {u_name} ({user_handle})\n"
+        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+        f"📁 <b>Requested Category:</b> <b>{c_name}</b> (<code>{c_key}</code>)\n"
+        f"🕒 <b>Time:</b> {datetime.utcnow().strftime('%d %b %Y, %H:%M UTC')}\n\n"
+        f"👇 <i>Review and choose action:</i>"
     )
     admin_keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Approve to {cat_name}", callback_data=f"mod_appr_{sub_id}_{cat_key}")],
@@ -1894,26 +1899,48 @@ async def user_submit_category_callback(update: Update, context: ContextTypes.DE
         [InlineKeyboardButton("❌ Reject Video", callback_data=f"mod_rejc_{sub_id}")]
     ])
 
+    sent = False
     try:
         await context.bot.send_video(
             chat_id=ADMIN_ID,
             video=file_id,
             caption=admin_caption,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=admin_keyboard
         )
+        sent = True
     except Exception as e:
-        logger.warning(f"Failed to send video to admin, trying document: {e}")
+        logger.warning(f"Failed to send video to admin with HTML: {e}")
+
+    if not sent:
         try:
             await context.bot.send_document(
                 chat_id=ADMIN_ID,
                 document=file_id,
                 caption=admin_caption,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=admin_keyboard
             )
+            sent = True
         except Exception as e2:
-            logger.error(f"Failed to send submission to admin: {e2}")
+            logger.warning(f"Failed to send document to admin with HTML: {e2}")
+
+    if not sent:
+        plain_caption = (
+            f"📩 New User Video Submission!\n\n"
+            f"From: {user.full_name} (@{user.username})\n"
+            f"User ID: {user.id}\n"
+            f"Requested Category: {cat_name}\n"
+        )
+        try:
+            await context.bot.send_video(
+                chat_id=ADMIN_ID,
+                video=file_id,
+                caption=plain_caption,
+                reply_markup=admin_keyboard
+            )
+        except Exception as e3:
+            logger.error(f"Ultimate fallback send_video to admin failed: {e3}")
 
 async def admin_moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1941,7 +1968,7 @@ async def admin_moderation_callback(update: Update, context: ContextTypes.DEFAUL
             return
 
         if sub_doc.get("status") != "pending":
-            await query.edit_message_caption(caption=f"ℹ️ Already processed: **{sub_doc.get('status')}**.", parse_mode="Markdown")
+            await query.edit_message_caption(caption=f"ℹ️ Already processed: <b>{html.escape(sub_doc.get('status', ''))}</b>.", parse_mode="HTML")
             return
 
         file_id = sub_doc["file_id"]
@@ -1962,25 +1989,28 @@ async def admin_moderation_callback(update: Update, context: ContextTypes.DEFAUL
         )
 
         total_cnt = category_counts_cache.get(cat_key, 0)
+        c_name = html.escape(cat_name)
+        c_key = html.escape(cat_key)
+        u_name = html.escape(str(sub_doc.get("user_name", "User")))
         await query.edit_message_caption(
             caption=(
-                f"✅ **Submission APPROVED!**\n\n"
-                f"📁 Added to: **{cat_name}** (`{cat_key}`)\n"
-                f"👤 Submitter: {sub_doc['user_name']} (`{sub_doc['user_id']}`)\n"
-                f"🎬 Total in Category: **{total_cnt}** videos"
+                f"✅ <b>Submission APPROVED!</b>\n\n"
+                f"📁 Added to: <b>{c_name}</b> (<code>{c_key}</code>)\n"
+                f"👤 Submitter: {u_name} (<code>{sub_doc['user_id']}</code>)\n"
+                f"🎬 Total in Category: <b>{total_cnt}</b> videos"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
         try:
             await context.bot.send_message(
                 chat_id=sub_doc["user_id"],
                 text=(
-                    f"🎉 **Video Approved!**\n\n"
-                    f"Aapki submit ki gayi video Admin dwara verify karke **{cat_name}** me add kar di gayi hai!\n"
+                    f"🎉 <b>Video Approved!</b>\n\n"
+                    f"Aapki submit ki gayi video Admin dwara verify karke <b>{c_name}</b> me add kar di gayi hai!\n"
                     f"Thank you for sharing with our community! ❤️"
                 ),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         except Exception:
             pass
@@ -2019,7 +2049,7 @@ async def admin_moderation_callback(update: Update, context: ContextTypes.DEFAUL
             return
 
         if sub_doc.get("status") != "pending":
-            await query.edit_message_caption(caption=f"ℹ️ Already processed: **{sub_doc.get('status')}**.", parse_mode="Markdown")
+            await query.edit_message_caption(caption=f"ℹ️ Already processed: <b>{html.escape(sub_doc.get('status', ''))}</b>.", parse_mode="HTML")
             return
 
         await submissions_collection.update_one(
@@ -2027,20 +2057,21 @@ async def admin_moderation_callback(update: Update, context: ContextTypes.DEFAUL
             {"$set": {"status": "rejected", "reviewed_at": datetime.utcnow()}}
         )
 
+        u_name = html.escape(str(sub_doc.get("user_name", "User")))
         await query.edit_message_caption(
             caption=(
-                f"❌ **Submission REJECTED.**\n\n"
-                f"👤 Submitter: {sub_doc['user_name']} (`{sub_doc['user_id']}`)\n"
+                f"❌ <b>Submission REJECTED.</b>\n\n"
+                f"👤 Submitter: {u_name} (<code>{sub_doc['user_id']}</code>)\n"
                 f"Video discard kar di gayi aur bot me add nahi hui."
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
         try:
             await context.bot.send_message(
                 chat_id=sub_doc["user_id"],
-                text="ℹ️ **Submission Update:**\n\nAapki submit ki gayi video Admin review me approve nahi ho saki.",
-                parse_mode="Markdown"
+                text="ℹ️ <b>Submission Update:</b>\n\nAapki submit ki gayi video Admin review me approve nahi ho saki.",
+                parse_mode="HTML"
             )
         except Exception:
             pass
