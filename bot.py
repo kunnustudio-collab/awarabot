@@ -48,22 +48,78 @@ users_collection = db["users"]
 videos_collection = db["videos"]
 settings_collection = db["settings"]
 
-# In-memory video count cache to eliminate 9-second MongoDB Atlas scans
-cached_video_count = 0
-last_count_refresh = 0
+# --- Categories Configuration ---
+CATEGORIES = {
+    "leakvideos": {
+        "name": "🎬 𝐋𝐞𝐚𝐤 𝐕𝐢𝐝𝐞𝐨𝐬",
+        "premium_only": False,
+        "default_channel": "@AwaraZone0"
+    },
+    "vip_exclusive": {
+        "name": "👑 𝐕𝐈𝐏 𝐄𝐱𝐜𝐥𝐮𝐬𝐢𝐯𝐞",
+        "premium_only": True,
+        "default_channel": "@AwaraVIP"
+    },
+    "desi_special": {
+        "name": "🔥 𝐃𝐞𝐬𝐢 𝐒𝐩𝐞𝐜𝐢𝐚𝐥",
+        "premium_only": True,
+        "default_channel": "@AwaraDesi"
+    },
+    "trending_hot": {
+        "name": "⚡ 𝐓𝐫𝐞𝐧𝐝𝐢𝐧𝐠 𝐇𝐨𝐭",
+        "premium_only": True,
+        "default_channel": "@AwaraTrending"
+    },
+    "international": {
+        "name": "💃 𝐈𝐧𝐭𝐞𝐫𝐧𝐚𝐭𝐢𝐨𝐧𝐚𝐥",
+        "premium_only": True,
+        "default_channel": "@AwaraWorld"
+    }
+}
+
+# Per-category in-memory video count cache for instant response
+category_counts_cache = {}
+category_counts_time = {}
+
+def get_category_query(category_key):
+    if category_key == "leakvideos":
+        return {"$or": [{"category": "leakvideos"}, {"category": {"$exists": False}}, {"category": None}]}
+    return {"category": category_key}
+
+async def get_category_videos_count(category_key="leakvideos"):
+    now = time.time()
+    cached = category_counts_cache.get(category_key)
+    last_time = category_counts_time.get(category_key, 0)
+    if cached is None or (now - last_time > 300):
+        try:
+            query = get_category_query(category_key)
+            cnt = await videos_collection.count_documents(query)
+            category_counts_cache[category_key] = cnt
+            category_counts_time[category_key] = now
+            return cnt
+        except Exception:
+            return cached if cached is not None else 0
+    return cached
 
 async def get_total_videos_count():
-    global cached_video_count, last_count_refresh
-    now = time.time()
-    if cached_video_count <= 0 or (now - last_count_refresh > 300):
-        try:
-            cached_video_count = await videos_collection.estimated_document_count()
-            last_count_refresh = now
-        except Exception:
-            if cached_video_count <= 0:
-                cached_video_count = await videos_collection.count_documents({})
-                last_count_refresh = now
-    return cached_video_count
+    total = 0
+    for cat in CATEGORIES.keys():
+        total += await get_category_videos_count(cat)
+    return total
+
+async def get_category_channels_settings():
+    settings = await settings_collection.find_one({"_id": "category_channels"})
+    if not settings:
+        settings = {
+            "_id": "category_channels",
+            "leakvideos": "@AwaraZone0",
+            "vip_exclusive": "",
+            "desi_special": "",
+            "trending_hot": "",
+            "international": ""
+        }
+        await settings_collection.insert_one(settings)
+    return settings
 
 # In-memory rename jobs keyed by admin user id
 rename_jobs = {}
@@ -110,12 +166,13 @@ async def add_user(user_id, full_name):
         if update_fields:
             await users_collection.update_one({"_id": user_id}, {"$set": update_fields})
 
-async def get_random_video():
-    count = await get_total_videos_count()
+async def get_random_video(category_key="leakvideos"):
+    count = await get_category_videos_count(category_key)
     if count <= 0:
         return None
     skip = random.randint(0, count - 1)
-    return await videos_collection.find_one({}, skip=skip)
+    query = get_category_query(category_key)
+    return await videos_collection.find_one(query, skip=skip)
 
 async def notify_group(text):
     try:
@@ -515,21 +572,37 @@ async def categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     except Exception:
         pass
+    user_id = query.from_user.id
     chat_id = update.effective_chat.id
-    keyboard = [
-        [InlineKeyboardButton("🎬 𝐋𝐞𝐚𝐤 𝐕𝐢𝐝𝐞𝐨𝐬", callback_data="leakvideos")],
-        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="start")]
-    ]
-    
+
+    user = await get_user(user_id)
+    is_premium = user and (user.get("unlimited_access") or is_premium_record(user))
+
+    keyboard = []
+    for cat_key, cat_data in CATEGORIES.items():
+        if cat_data["premium_only"]:
+            badge = "💎" if is_premium else "🔒"
+            btn_text = f"{cat_data['name']} {badge}"
+        else:
+            btn_text = f"{cat_data['name']} (Free)"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"cat_{cat_key}")])
+
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="start")])
+
     try:
         if query.message:
             await query.message.delete()
     except Exception as e:
         logger.info(f"Could not delete message in categories_menu: {e}")
-    
+
     await context.bot.send_message(
         chat_id=chat_id,
-        text="📂 𝐒𝐞𝐥𝐞𝐜𝐭 𝐚 𝐜𝐚𝐭𝐞𝐠𝐨𝐫𝐲:",
+        text=(
+            "📂 𝐒𝐞𝐥𝐞𝐜𝐭 𝐚 𝐜𝐚𝐭𝐞𝐠𝐨𝐫𝐲:\n\n"
+            "• Free users can access **Leak Videos**.\n"
+            "• Categories with 🔒 are exclusively for **Premium Members**."
+        ),
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -572,6 +645,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Video", callback_data="admin_add")],
         [InlineKeyboardButton("📥 AddAll Videos", callback_data="admin_addall")],
+        [InlineKeyboardButton("📁 Category Channels", callback_data="admin_catchannels")],
         [InlineKeyboardButton("🧹 Clean DB", callback_data="admin_clean")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
         [InlineKeyboardButton("💎 Premium User", callback_data="admin_premium")],
@@ -626,15 +700,16 @@ async def admin_command_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     command_text = {
-        "admin_add": "/add <message_link>",
-        "admin_addall": "/addall <start_link> <end_id>",
-        "admin_clean": "/clean",
+        "admin_add": "/add <message_link> [category]",
+        "admin_addall": "/addall <start_link> <end_id> [category] [bg|fg]",
+        "admin_catchannels": "/categorychannels and /setcategorychannel <category> <channel>",
+        "admin_clean": "/clean [category] (or /clean for all)",
         "admin_stats": "/stats",
         "admin_premium": "/premium <user_id> [days]",
         "admin_removepremium": "/removepremium <user_id>",
         "admin_setpremiumprice": "/setpremiumprice <package> <amount>",
-        "admin_broadcast": "/broadcast <text> or reply to a message with /broadcast"
-        ,"admin_rename": "/renamechannel <channel_username_or_link> <start_number> <keep_ext:yes/no>"
+        "admin_broadcast": "/broadcast <text> or reply to a message with /broadcast",
+        "admin_rename": "/renamechannel <channel_username_or_link> <start_number> <keep_ext:yes/no>"
     }.get(query.data, "Unknown command")
 
     text = f"Use this command:\n`{command_text}`"
@@ -719,44 +794,97 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def category_video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     try:
         await query.answer()
     except Exception:
         pass
+
+    data = query.data or "leakvideos"
+    if data == "leakvideos":
+        category_key = "leakvideos"
+    elif data.startswith("cat_"):
+        category_key = data[4:]
+    else:
+        category_key = "leakvideos"
+
+    cat_data = CATEGORIES.get(category_key, CATEGORIES["leakvideos"])
     user_id = query.from_user.id
     chat_id = update.effective_chat.id
 
-    if not await can_watch_video(user_id):
+    user = await get_user(user_id)
+    is_premium = user and (user.get("unlimited_access") or is_premium_record(user))
+
+    # 1. Premium-only category restriction
+    if cat_data.get("premium_only", False) and not is_premium:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 Buy Premium Subscription", callback_data="buy_premium")],
+            [InlineKeyboardButton("🔙 Back to Categories", callback_data="categories")]
+        ])
+        try:
+            if query.message:
+                await query.message.delete()
+        except Exception:
+            pass
         await context.bot.send_message(
             chat_id=chat_id,
-            text=("🚫 Your daily free limit has ended.\n\n"
-                  "You have watched today's free videos.\n\n"
-                  "You are not a premium user. Buy premium to @MeAwara."),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💎 Buy Premium Subscription", callback_data="buy_premium")],
-                [InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]
-            ])
+            text=(
+                f"🔒 **{cat_data['name']} is a Premium Category!**\n\n"
+                "Yeh category sirf hamare **Premium Members** ke liye reserved hai.\n\n"
+                "Is category ke sabhi exclusive videos dekhne ke liye abhi Premium buy karein! 👇"
+            ),
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
         return
 
-    video_data = await get_random_video()
+    # 2. Daily free limit check (only for non-premium users on free categories)
+    if not is_premium:
+        if not await can_watch_video(user_id):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=("🚫 Your daily free limit has ended.\n\n"
+                      "You have watched today's free videos.\n\n"
+                      "You are not a premium user. Buy premium to @MeAwara."),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💎 Buy Premium Subscription", callback_data="buy_premium")],
+                    [InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]
+                ])
+            )
+            return
+
+    # 3. Retrieve random video from this category
+    video_data = await get_random_video(category_key)
     if not video_data:
-        await context.bot.send_message(chat_id, "⚠️ No videos found in the database.")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 Other Categories", callback_data="categories")],
+            [InlineKeyboardButton("🔙 Back to Menu", callback_data="start")]
+        ])
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ No videos found in **{cat_data['name']}** category yet.\nAdmin will upload videos soon!",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
         return
 
+    # 4. Deliver video
     try:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Next Video", callback_data=f"cat_{category_key}")],
+            [InlineKeyboardButton("📂 Categories", callback_data="categories"), InlineKeyboardButton("🔙 Back", callback_data="start")]
+        ])
         sent = await context.bot.send_video(
             chat_id=chat_id,
             video=video_data['file_id'],
-            caption="Save or forward this video now! ⏳ ये वीडियो 5 मिनट बाद हट जाएगी।",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Next Video", callback_data="leakvideos")],
-                [InlineKeyboardButton("📂 Categories", callback_data="categories"), InlineKeyboardButton("🔙 Back", callback_data="start")]
-            ])
+            caption=f"📁 *Category: {cat_data['name']}*\n\nSave or forward this video now! ⏳ ये वीडियो 5 मिनट बाद हट जाएगी।",
+            parse_mode="Markdown",
+            reply_markup=keyboard
         )
-        await increment_video_watch(user_id)
+        if not is_premium:
+            await increment_video_watch(user_id)
+
         try:
             if query.message:
                 await query.message.delete()
@@ -765,14 +893,17 @@ async def send_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         asyncio.create_task(delete_message_after_delay(context, chat_id, sent.message_id, 300))
     except Exception as e:
-        logger.error(f"Error sending video: {e}")
+        logger.error(f"Error sending video for category {category_key}: {e}")
         await context.bot.send_message(
             chat_id=chat_id,
             text="⚠️ Video send failed. Tap below to try next video:",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ Try Next Video", callback_data="leakvideos")]
+                [InlineKeyboardButton("▶️ Try Next Video", callback_data=f"cat_{category_key}")]
             ])
         )
+
+# Alias for backwards compatibility
+send_video = category_video_handler
 
 async def delete_message_after_delay(context, chat_id, message_id, delay):
     await asyncio.sleep(delay)
@@ -811,10 +942,30 @@ async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
     if not context.args:
-        await update.message.reply_text("Please provide a message link.")
+        cat_list = ", ".join(CATEGORIES.keys())
+        await update.message.reply_text(
+            f"Please provide a message link and optional category.\n\n"
+            f"Usage: `/add <link> [category]`\n"
+            f"Available categories: `{cat_list}`\n"
+            f"Example: `/add https://t.me/c/123/42 vip_exclusive`",
+            parse_mode="Markdown"
+        )
         return
 
     link = context.args[0]
+    category = "leakvideos"
+    if len(context.args) > 1:
+        chosen_cat = context.args[1].lower()
+        if chosen_cat in CATEGORIES:
+            category = chosen_cat
+        else:
+            cat_list = ", ".join(CATEGORIES.keys())
+            await update.message.reply_text(
+                f"❌ Invalid category `{chosen_cat}`.\nAvailable: `{cat_list}`",
+                parse_mode="Markdown"
+            )
+            return
+
     chat_id, message_id = parse_channel_link(link)
     if not chat_id or not message_id:
         await update.message.reply_text("❌ Invalid channel link. Use a message link like https://t.me/c/1234567890/42 or https://t.me/ChannelName/42")
@@ -824,8 +975,10 @@ async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.forward_message(chat_id=ADMIN_ID, from_chat_id=chat_id, message_id=message_id)
         if msg.video:
             if await videos_collection.count_documents({"file_id": msg.video.file_id}) == 0:
-                await videos_collection.insert_one({"file_id": msg.video.file_id})
-                await update.message.reply_text("✅ Video Saved!")
+                await videos_collection.insert_one({"file_id": msg.video.file_id, "category": category})
+                category_counts_cache[category] = category_counts_cache.get(category, 0) + 1
+                cat_name = CATEGORIES[category]["name"]
+                await update.message.reply_text(f"✅ Video Saved to **{cat_name}** (`{category}`)!", parse_mode="Markdown")
             else:
                 await update.message.reply_text("ℹ️ This video is already in the database.")
         else:
@@ -848,7 +1001,7 @@ async def _update_add_all_status(bot, status_chat_id, status_message_id, text):
     except Exception:
         pass
 
-async def run_add_all_videos(bot, chat_id, start_id, end_id, status_chat_id, status_message_id):
+async def run_add_all_videos(bot, chat_id, start_id, end_id, category, status_chat_id, status_message_id):
     stop_event = asyncio.Event()
     add_all_state.update({
         "active": True,
@@ -860,6 +1013,7 @@ async def run_add_all_videos(bot, chat_id, start_id, end_id, status_chat_id, sta
 
     added, skipped, failed = 0, 0, 0
     total = end_id - start_id + 1
+    cat_name = CATEGORIES.get(category, {}).get("name", category)
 
     try:
         for i, mid in enumerate(range(start_id, end_id + 1)):
@@ -869,7 +1023,7 @@ async def run_add_all_videos(bot, chat_id, start_id, end_id, status_chat_id, sta
                 msg = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=chat_id, message_id=mid)
                 if msg.video:
                     if await videos_collection.count_documents({"file_id": msg.video.file_id}) == 0:
-                        await videos_collection.insert_one({"file_id": msg.video.file_id})
+                        await videos_collection.insert_one({"file_id": msg.video.file_id, "category": category})
                         added += 1
                     else:
                         skipped += 1
@@ -883,32 +1037,34 @@ async def run_add_all_videos(bot, chat_id, start_id, end_id, status_chat_id, sta
                     bot,
                     status_chat_id,
                     status_message_id,
-                    f"🔄 **Processing...** {i+1}/{total}\n✅ Added: {added} | ⏩ Skipped: {skipped} | ❌ Failed: {failed}"
+                    f"🔄 **Processing [{cat_name}]...** {i+1}/{total}\n✅ Added: {added} | ⏩ Skipped: {skipped} | ❌ Failed: {failed}"
                 )
             if stop_event.is_set():
                 break
             await asyncio.sleep(1.5)
+
+        category_counts_cache[category] = category_counts_cache.get(category, 0) + added
 
         if stop_event.is_set():
             await _update_add_all_status(
                 bot,
                 status_chat_id,
                 status_message_id,
-                "⏹️ **Batch Stopped!**\n\nThe /addall process was interrupted by admin."
+                f"⏹️ **Batch Stopped!**\n\nThe /addall process for **{cat_name}** was interrupted by admin."
             )
         else:
             await _update_add_all_status(
                 bot,
                 status_chat_id,
                 status_message_id,
-                f"✅ **Batch Finished!**\n\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**"
+                f"✅ **Batch Finished for {cat_name}!**\n\n- Category: `{category}`\n- Added: **{added}**\n- Skipped: **{skipped}**\n- Failed: **{failed}**"
             )
     except asyncio.CancelledError:
         await _update_add_all_status(
             bot,
             status_chat_id,
             status_message_id,
-            "⏹️ **Batch Stopped!**\n\nThe /addall process was interrupted by admin."
+            f"⏹️ **Batch Stopped!**\n\nThe /addall process for **{cat_name}** was interrupted by admin."
         )
         raise
     except Exception as e:
@@ -934,18 +1090,27 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     background = ADD_ALL_BACKGROUND_DEFAULT
-    args = list(context.args)
+    category = "leakvideos"
+    remaining_args = []
 
-    if len(args) == 3 and args[-1].lower() in {"background", "bg", "true", "yes"}:
-        background = True
-        args = args[:-1]
-    elif len(args) == 3 and args[-1].lower() in {"foreground", "fg", "false", "no"}:
-        background = False
-        args = args[:-1]
+    for arg in context.args:
+        arg_lower = arg.lower()
+        if arg_lower in {"background", "bg", "true", "yes"}:
+            background = True
+        elif arg_lower in {"foreground", "fg", "false", "no"}:
+            background = False
+        elif arg_lower in CATEGORIES:
+            category = arg_lower
+        else:
+            remaining_args.append(arg)
 
-    if len(args) != 2:
+    if len(remaining_args) != 2:
+        cat_list = ", ".join(CATEGORIES.keys())
         await update.message.reply_text(
-            "❌ **Invalid Usage**\n\nUse: `/addall <start_link> <end_id> [background|foreground]`",
+            "❌ **Invalid Usage**\n\n"
+            "Use: `/addall <start_link> <end_id> [category] [background|foreground]`\n\n"
+            f"Available categories: `{cat_list}`\n\n"
+            "Example: `/addall https://t.me/c/1234567890/10 50 vip_exclusive bg`",
             parse_mode='Markdown'
         )
         return
@@ -954,7 +1119,7 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ /addall is already running. Use /stopaddall to stop it.")
         return
 
-    start_link, end_id_str = args
+    start_link, end_id_str = remaining_args
     chat_id, start_id = parse_channel_link(start_link)
     if not chat_id or not start_id:
         await update.message.reply_text("❌ Invalid channel link. Use a message link like https://t.me/c/1234567890/42 or https://t.me/ChannelName/42", parse_mode='Markdown')
@@ -969,8 +1134,11 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid end ID.")
         return
 
+    cat_name = CATEGORIES[category]["name"]
     status_message = await update.message.reply_text(
-        f"🔄 Batch process started for **{start_id}** to **{end_id}**...\n\nMode: **{'Background' if background else 'Foreground'}**",
+        f"🔄 Batch process started for **{start_id}** to **{end_id}**...\n\n"
+        f"📁 Category: **{cat_name}** (`{category}`)\n"
+        f"⚙️ Mode: **{'Background' if background else 'Foreground'}**",
         parse_mode='Markdown'
     )
 
@@ -981,18 +1149,20 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id,
                 start_id,
                 end_id,
+                category,
                 status_message.chat_id,
                 status_message.message_id,
             )
         )
         add_all_state["task"] = task
-        await update.message.reply_text("✅ /addall is running in the background. You can keep using the bot.")
+        await update.message.reply_text(f"✅ /addall is running in background for **{cat_name}**.", parse_mode="Markdown")
     else:
         await run_add_all_videos(
             context.bot,
             chat_id,
             start_id,
             end_id,
+            category,
             status_message.chat_id,
             status_message.message_id,
         )
@@ -1015,17 +1185,79 @@ async def stop_addall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 Stop requested for the current /addall batch.")
 
 async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id == ADMIN_ID:
-        await videos_collection.delete_many({})
-        global cached_video_count
-        cached_video_count = 0
-        await update.message.reply_text("✅ All videos have been deleted.")
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    if context.args:
+        cat_arg = context.args[0].lower()
+        if cat_arg in CATEGORIES:
+            query = get_category_query(cat_arg)
+            result = await videos_collection.delete_many(query)
+            category_counts_cache[cat_arg] = 0
+            await update.message.reply_text(f"✅ Deleted {result.deleted_count} videos from **{CATEGORIES[cat_arg]['name']}** (`{cat_arg}`).", parse_mode="Markdown")
+            return
+    await videos_collection.delete_many({})
+    category_counts_cache.clear()
+    await update.message.reply_text("✅ All videos from all categories have been deleted.")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.from_user.id == ADMIN_ID:
-        total_users = await users_collection.count_documents({})
-        total_videos = await get_total_videos_count()
-        await update.message.reply_text(f"📊 **Stats**\n\n- Users: {total_users}\n- Videos: {total_videos}", parse_mode='Markdown')
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    total_users = await users_collection.count_documents({})
+    total_videos = await videos_collection.count_documents({})
+    breakdown = []
+    for k, v in CATEGORIES.items():
+        cnt = await get_category_videos_count(k)
+        prem = "👑 VIP" if v["premium_only"] else "🆓 Free"
+        breakdown.append(f"• {v['name']} ({prem}): **{cnt}**")
+    cat_text = "\n".join(breakdown)
+    await update.message.reply_text(
+        f"📊 **Bot Statistics**\n\n"
+        f"👤 Total Users: **{total_users}**\n"
+        f"🎬 Total Videos: **{total_videos}**\n\n"
+        f"📁 **Category Breakdown:**\n{cat_text}",
+        parse_mode='Markdown'
+    )
+
+async def set_category_channel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    if len(context.args) < 2:
+        cat_list = ", ".join(CATEGORIES.keys())
+        await update.message.reply_text(
+            f"Usage: `/setcategorychannel <category> <channel_link_or_username>`\n\n"
+            f"Categories: `{cat_list}`\n"
+            f"Example: `/setcategorychannel vip_exclusive https://t.me/c/1234567890` or `@MyVipChannel`",
+            parse_mode="Markdown"
+        )
+        return
+
+    cat_key = context.args[0].lower()
+    if cat_key not in CATEGORIES:
+        cat_list = ", ".join(CATEGORIES.keys())
+        await update.message.reply_text(f"❌ Invalid category `{cat_key}`. Available: `{cat_list}`", parse_mode="Markdown")
+        return
+
+    channel = context.args[1]
+    await settings_collection.update_one(
+        {"_id": "category_channels"},
+        {"$set": {cat_key: channel}},
+        upsert=True
+    )
+    cat_name = CATEGORIES[cat_key]["name"]
+    await update.message.reply_text(f"✅ Channel for **{cat_name}** (`{cat_key}`) updated to: `{channel}`", parse_mode="Markdown")
+
+async def category_channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    settings = await get_category_channels_settings()
+    lines = ["📁 **Categories & Linked Channels:**\n"]
+    for k, v in CATEGORIES.items():
+        ch = settings.get(k) or "(No channel linked yet)"
+        prem = "👑 Premium Only" if v["premium_only"] else "🆓 Free & Premium"
+        cnt = await get_category_videos_count(k)
+        lines.append(f"• **{v['name']}** (`{k}`)\n  - Type: {prem}\n  - Channel: `{ch}`\n  - Videos: **{cnt}**\n")
+    lines.append("To update a channel: `/setcategorychannel <category> <channel>`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
@@ -1371,6 +1603,8 @@ def build_application():
     application.add_handler(CommandHandler("setpremiumprice", setpremiumprice))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("renamechannel", renamechannel_cmd))
+    application.add_handler(CommandHandler("categorychannels", category_channels_cmd))
+    application.add_handler(CommandHandler("setcategorychannel", set_category_channel_cmd))
     
     application.add_handler(CallbackQueryHandler(check_joined, pattern="^check_joined$"))
     application.add_handler(CallbackQueryHandler(categories_menu, pattern="^categories$"))
@@ -1382,7 +1616,7 @@ def build_application():
     application.add_handler(CallbackQueryHandler(rename_confirm_cb, pattern="^rename_confirm$"))
     application.add_handler(CallbackQueryHandler(rename_cancel_cb, pattern="^rename_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_command_info, pattern="^admin_.*$"))
-    application.add_handler(CallbackQueryHandler(send_video, pattern="^leakvideos$"))
+    application.add_handler(CallbackQueryHandler(category_video_handler, pattern="^(cat_.*|leakvideos)$"))
     application.add_error_handler(error_handler)
 
     return application
