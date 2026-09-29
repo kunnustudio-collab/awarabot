@@ -1688,23 +1688,27 @@ async def autoadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Direct Video Upload by Admin in PM ---
 async def prompt_admin_save_video(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
-    context.user_data["pending_video_file_id"] = file_id
+    prompt_msg = await update.effective_message.reply_text("⏳ Processing video...")
+    mid = prompt_msg.message_id
+    context.user_data[f"vid_{mid}"] = file_id
+
     keyboard = []
     row = []
     for num, k in CATEGORY_NUM_MAP.items():
         v = CATEGORIES[k]
-        row.append(InlineKeyboardButton(f"{num}. {v['name']}", callback_data=f"savevid_{k}"))
+        row.append(InlineKeyboardButton(f"{num}. {v['name']}", callback_data=f"savevid_{k}_{mid}"))
         if len(row) == 2:
             keyboard.append(row)
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="savevid_cancel")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"savevid_cancel_{mid}")])
 
-    await update.effective_message.reply_text(
+    await prompt_msg.edit_text(
         "📹 **New Video Received!**\n\n"
         "Choose a category to save this video:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
     )
 
 async def admin_save_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1715,19 +1719,24 @@ async def admin_save_video_callback(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
 
     data = query.data
-    if data == "savevid_cancel":
-        context.user_data.pop("pending_video_file_id", None)
+    if "cancel" in data:
+        parts = data.split("_")
+        mid = parts[-1]
+        context.user_data.pop(f"vid_{mid}", None)
         await query.edit_message_text("❌ Video saving cancelled.")
         return
 
-    cat_key = data.replace("savevid_", "")
+    parts = data.split("_")
+    mid = parts[-1]
+    cat_key = "_".join(parts[1:-1])
+
     if cat_key not in CATEGORIES:
         await query.edit_message_text("❌ Unknown category.")
         return
 
-    file_id = context.user_data.pop("pending_video_file_id", None)
+    file_id = context.user_data.pop(f"vid_{mid}", None)
     if not file_id:
-        await query.edit_message_text("⚠️ No pending video found. Please send the video again.")
+        await query.edit_message_text("⚠️ No pending video found (already saved or expired).")
         return
 
     existing = await videos_collection.find_one({"file_id": file_id})
