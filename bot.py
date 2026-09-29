@@ -50,30 +50,35 @@ settings_collection = db["settings"]
 
 # --- Categories Configuration ---
 CATEGORIES = {
-    "leakvideos": {
-        "name": "🎬 𝐋𝐞𝐚𝐤 𝐕𝐢𝐝𝐞𝐨𝐬",
+    "free_videos": {
+        "name": "🎬 𝐅𝐫𝐞𝐞 𝐕𝐢𝐝𝐞𝐨𝐬",
         "premium_only": False,
         "default_channel": "@AwaraZone0"
+    },
+    "trending_viral": {
+        "name": "🚀 𝐓𝐫𝐞𝐧𝐝𝐢𝐧𝐠 𝐕𝐢𝐫𝐚𝐥",
+        "premium_only": True,
+        "default_channel": ""
     },
     "vip_exclusive": {
         "name": "👑 𝐕𝐈𝐏 𝐄𝐱𝐜𝐥𝐮𝐬𝐢𝐯𝐞",
         "premium_only": True,
-        "default_channel": "@AwaraVIP"
+        "default_channel": ""
     },
     "desi_special": {
         "name": "🔥 𝐃𝐞𝐬𝐢 𝐒𝐩𝐞𝐜𝐢𝐚𝐥",
         "premium_only": True,
-        "default_channel": "@AwaraDesi"
+        "default_channel": ""
     },
     "trending_hot": {
         "name": "⚡ 𝐓𝐫𝐞𝐧𝐝𝐢𝐧𝐠 𝐇𝐨𝐭",
         "premium_only": True,
-        "default_channel": "@AwaraTrending"
+        "default_channel": ""
     },
     "international": {
         "name": "💃 𝐈𝐧𝐭𝐞𝐫𝐧𝐚𝐭𝐢𝐨𝐧𝐚𝐥",
         "premium_only": True,
-        "default_channel": "@AwaraWorld"
+        "default_channel": ""
     }
 }
 
@@ -82,11 +87,16 @@ category_counts_cache = {}
 category_counts_time = {}
 
 def get_category_query(category_key):
-    if category_key == "leakvideos":
-        return {"$or": [{"category": "leakvideos"}, {"category": {"$exists": False}}, {"category": None}]}
+    if category_key in ("free_videos", "leakvideos"):
+        return {"$or": [
+            {"category": "free_videos"},
+            {"category": "leakvideos"},
+            {"category": {"$exists": False}},
+            {"category": None}
+        ]}
     return {"category": category_key}
 
-async def get_category_videos_count(category_key="leakvideos"):
+async def get_category_videos_count(category_key="free_videos"):
     now = time.time()
     cached = category_counts_cache.get(category_key)
     last_time = category_counts_time.get(category_key, 0)
@@ -112,7 +122,8 @@ async def get_category_channels_settings():
     if not settings:
         settings = {
             "_id": "category_channels",
-            "leakvideos": "@AwaraZone0",
+            "free_videos": "@AwaraZone0",
+            "trending_viral": "",
             "vip_exclusive": "",
             "desi_special": "",
             "trending_hot": "",
@@ -166,7 +177,7 @@ async def add_user(user_id, full_name):
         if update_fields:
             await users_collection.update_one({"_id": user_id}, {"$set": update_fields})
 
-async def get_random_video(category_key="leakvideos"):
+async def get_random_video(category_key="free_videos"):
     count = await get_category_videos_count(category_key)
     if count <= 0:
         return None
@@ -801,15 +812,17 @@ async def category_video_handler(update: Update, context: ContextTypes.DEFAULT_T
     except Exception:
         pass
 
-    data = query.data or "leakvideos"
-    if data == "leakvideos":
-        category_key = "leakvideos"
+    data = query.data or "free_videos"
+    if data in ("leakvideos", "free_videos"):
+        category_key = "free_videos"
     elif data.startswith("cat_"):
         category_key = data[4:]
+        if category_key == "leakvideos":
+            category_key = "free_videos"
     else:
-        category_key = "leakvideos"
+        category_key = "free_videos"
 
-    cat_data = CATEGORIES.get(category_key, CATEGORIES["leakvideos"])
+    cat_data = CATEGORIES.get(category_key, CATEGORIES["free_videos"])
     user_id = query.from_user.id
     chat_id = update.effective_chat.id
 
@@ -953,10 +966,12 @@ async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     link = context.args[0]
-    category = "leakvideos"
+    category = "free_videos"
     if len(context.args) > 1:
         chosen_cat = context.args[1].lower()
-        if chosen_cat in CATEGORIES:
+        if chosen_cat in ("leakvideos", "free_videos"):
+            category = "free_videos"
+        elif chosen_cat in CATEGORIES:
             category = chosen_cat
         else:
             cat_list = ", ".join(CATEGORIES.keys())
@@ -1090,7 +1105,7 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     background = ADD_ALL_BACKGROUND_DEFAULT
-    category = "leakvideos"
+    category = "free_videos"
     remaining_args = []
 
     for arg in context.args:
@@ -1099,6 +1114,8 @@ async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             background = True
         elif arg_lower in {"foreground", "fg", "false", "no"}:
             background = False
+        elif arg_lower in ("leakvideos", "free_videos"):
+            category = "free_videos"
         elif arg_lower in CATEGORIES:
             category = arg_lower
         else:
