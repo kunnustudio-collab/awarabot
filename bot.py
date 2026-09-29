@@ -82,6 +82,36 @@ CATEGORIES = {
     }
 }
 
+# Category Number Mapping (1-6)
+CATEGORY_NUM_MAP = {
+    "1": "free_videos",
+    "2": "trending_viral",
+    "3": "vip_exclusive",
+    "4": "desi_special",
+    "5": "trending_hot",
+    "6": "international"
+}
+
+def resolve_category(cat_input):
+    if not cat_input:
+        return "free_videos"
+    val = str(cat_input).strip().lower()
+    if val in CATEGORY_NUM_MAP:
+        return CATEGORY_NUM_MAP[val]
+    if val in ("leakvideos", "free_videos"):
+        return "free_videos"
+    if val in CATEGORIES:
+        return val
+    return None
+
+def get_categories_help_text():
+    lines = []
+    for num, key in CATEGORY_NUM_MAP.items():
+        name = CATEGORIES[key]["name"]
+        prem = "👑 VIP" if CATEGORIES[key]["premium_only"] else "🆓 Free"
+        lines.append(f"`{num}` = {name} ({prem})")
+    return "\n".join(lines)
+
 # Per-category in-memory video count cache for instant response
 category_counts_cache = {}
 category_counts_time = {}
@@ -610,7 +640,7 @@ async def categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         text=(
             "📂 𝐒𝐞𝐥𝐞𝐜𝐭 𝐚 𝐜𝐚𝐭𝐞𝐠𝐨𝐫𝐲:\n\n"
-            "• Free users can access **Leak Videos**.\n"
+            "• Free users can access **Free Videos**.\n"
             "• Categories with 🔒 are exclusively for **Premium Members**."
         ),
         parse_mode="Markdown",
@@ -710,11 +740,12 @@ async def admin_command_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("Access denied.", show_alert=True)
         return
 
+    cat_help = get_categories_help_text()
     command_text = {
-        "admin_add": "/add <message_link> [category]",
-        "admin_addall": "/addall <start_link> <end_id> [category] [bg|fg]",
-        "admin_catchannels": "/categorychannels and /setcategorychannel <category> <channel>",
-        "admin_clean": "/clean [category] (or /clean for all)",
+        "admin_add": f"/add <message_link> [1-6]\n\n📁 Categories:\n{cat_help}\n\nExample: `/add https://t.me/c/123/42 2`",
+        "admin_addall": f"/addall <start_link> <end_id> [1-6] [bg|fg]\n\n📁 Categories:\n{cat_help}\n\nExample: `/addall https://t.me/c/123/1 50 2 bg`",
+        "admin_catchannels": f"/categorychannels\nOr link channel:\n/setcategorychannel <1-6> <channel>\n\n📁 Categories:\n{cat_help}",
+        "admin_clean": f"/clean [1-6] (or /clean for all categories)\n\n📁 Categories:\n{cat_help}",
         "admin_stats": "/stats",
         "admin_premium": "/premium <user_id> [days]",
         "admin_removepremium": "/removepremium <user_id>",
@@ -723,7 +754,7 @@ async def admin_command_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "admin_rename": "/renamechannel <channel_username_or_link> <start_number> <keep_ext:yes/no>"
     }.get(query.data, "Unknown command")
 
-    text = f"Use this command:\n`{command_text}`"
+    text = f"**Command Info:**\n\n`{command_text}`"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
     ])
@@ -955,12 +986,12 @@ async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
     if not context.args:
-        cat_list = ", ".join(CATEGORIES.keys())
+        help_text = get_categories_help_text()
         await update.message.reply_text(
-            f"Please provide a message link and optional category.\n\n"
-            f"Usage: `/add <link> [category]`\n"
-            f"Available categories: `{cat_list}`\n"
-            f"Example: `/add https://t.me/c/123/42 vip_exclusive`",
+            f"Please provide a message link and category (number 1-6 or name).\n\n"
+            f"Usage: `/add <link> [category_number_1-6]`\n\n"
+            f"📁 **Categories:**\n{help_text}\n\n"
+            f"Example:\n`/add https://t.me/c/1234567890/42 2`",
             parse_mode="Markdown"
         )
         return
@@ -968,15 +999,14 @@ async def add_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = context.args[0]
     category = "free_videos"
     if len(context.args) > 1:
-        chosen_cat = context.args[1].lower()
-        if chosen_cat in ("leakvideos", "free_videos"):
-            category = "free_videos"
-        elif chosen_cat in CATEGORIES:
-            category = chosen_cat
+        resolved = resolve_category(context.args[1])
+        if resolved:
+            category = resolved
         else:
-            cat_list = ", ".join(CATEGORIES.keys())
+            help_text = get_categories_help_text()
             await update.message.reply_text(
-                f"❌ Invalid category `{chosen_cat}`.\nAvailable: `{cat_list}`",
+                f"❌ Invalid category `{context.args[1]}`.\n\n"
+                f"Please choose a number (1-6):\n{help_text}",
                 parse_mode="Markdown"
             )
             return
@@ -1103,40 +1133,47 @@ async def run_add_all_videos(bot, chat_id, start_id, end_id, category, status_ch
 async def add_all_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
+    if not context.args or len(context.args) < 2:
+        help_text = get_categories_help_text()
+        await update.message.reply_text(
+            "❌ **Invalid Usage**\n\n"
+            "Use: `/addall <start_link> <end_id> [category_1-6] [bg|fg]`\n\n"
+            f"📁 **Categories (1-6):**\n{help_text}\n\n"
+            "Examples:\n"
+            "• `/addall https://t.me/c/1234567890/10 50 2 bg`\n"
+            "• `/addall https://t.me/c/1234567890/10 50 1`",
+            parse_mode='Markdown'
+        )
+        return
 
     background = ADD_ALL_BACKGROUND_DEFAULT
     category = "free_videos"
-    remaining_args = []
+    start_link = context.args[0]
+    end_id_str = context.args[1]
 
-    for arg in context.args:
+    for arg in context.args[2:]:
         arg_lower = arg.lower()
         if arg_lower in {"background", "bg", "true", "yes"}:
             background = True
         elif arg_lower in {"foreground", "fg", "false", "no"}:
             background = False
-        elif arg_lower in ("leakvideos", "free_videos"):
-            category = "free_videos"
-        elif arg_lower in CATEGORIES:
-            category = arg_lower
         else:
-            remaining_args.append(arg)
-
-    if len(remaining_args) != 2:
-        cat_list = ", ".join(CATEGORIES.keys())
-        await update.message.reply_text(
-            "❌ **Invalid Usage**\n\n"
-            "Use: `/addall <start_link> <end_id> [category] [background|foreground]`\n\n"
-            f"Available categories: `{cat_list}`\n\n"
-            "Example: `/addall https://t.me/c/1234567890/10 50 vip_exclusive bg`",
-            parse_mode='Markdown'
-        )
-        return
+            resolved = resolve_category(arg)
+            if resolved:
+                category = resolved
+            else:
+                help_text = get_categories_help_text()
+                await update.message.reply_text(
+                    f"❌ Invalid category `{arg}`.\n\n"
+                    f"Please choose a number (1-6):\n{help_text}",
+                    parse_mode="Markdown"
+                )
+                return
 
     if add_all_state.get("active") and add_all_state.get("task") and not add_all_state["task"].done():
         await update.message.reply_text("⚠️ /addall is already running. Use /stopaddall to stop it.")
         return
 
-    start_link, end_id_str = remaining_args
     chat_id, start_id = parse_channel_link(start_link)
     if not chat_id or not start_id:
         await update.message.reply_text("❌ Invalid channel link. Use a message link like https://t.me/c/1234567890/42 or https://t.me/ChannelName/42", parse_mode='Markdown')
@@ -1205,12 +1242,21 @@ async def clean_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
         return
     if context.args:
-        cat_arg = context.args[0].lower()
-        if cat_arg in CATEGORIES:
-            query = get_category_query(cat_arg)
+        cat_key = resolve_category(context.args[0])
+        if cat_key:
+            query = get_category_query(cat_key)
             result = await videos_collection.delete_many(query)
-            category_counts_cache[cat_arg] = 0
-            await update.message.reply_text(f"✅ Deleted {result.deleted_count} videos from **{CATEGORIES[cat_arg]['name']}** (`{cat_arg}`).", parse_mode="Markdown")
+            category_counts_cache[cat_key] = 0
+            await update.message.reply_text(f"✅ Deleted {result.deleted_count} videos from **{CATEGORIES[cat_key]['name']}** (`{cat_key}`).", parse_mode="Markdown")
+            return
+        else:
+            help_text = get_categories_help_text()
+            await update.message.reply_text(
+                f"❌ Invalid category `{context.args[0]}`.\n\n"
+                f"Use `/clean <1-6>` or `/clean` to wipe all categories.\n\n"
+                f"📁 **Categories (1-6):**\n{help_text}",
+                parse_mode="Markdown"
+            )
             return
     await videos_collection.delete_many({})
     category_counts_cache.clear()
@@ -1222,10 +1268,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_users = await users_collection.count_documents({})
     total_videos = await videos_collection.count_documents({})
     breakdown = []
-    for k, v in CATEGORIES.items():
+    for num, k in CATEGORY_NUM_MAP.items():
+        v = CATEGORIES[k]
         cnt = await get_category_videos_count(k)
         prem = "👑 VIP" if v["premium_only"] else "🆓 Free"
-        breakdown.append(f"• {v['name']} ({prem}): **{cnt}**")
+        breakdown.append(f"`{num}`. {v['name']} ({prem}): **{cnt}**")
     cat_text = "\n".join(breakdown)
     await update.message.reply_text(
         f"📊 **Bot Statistics**\n\n"
@@ -1239,19 +1286,25 @@ async def set_category_channel_cmd(update: Update, context: ContextTypes.DEFAULT
     if update.message.from_user.id != ADMIN_ID:
         return
     if len(context.args) < 2:
-        cat_list = ", ".join(CATEGORIES.keys())
+        help_text = get_categories_help_text()
         await update.message.reply_text(
-            f"Usage: `/setcategorychannel <category> <channel_link_or_username>`\n\n"
-            f"Categories: `{cat_list}`\n"
-            f"Example: `/setcategorychannel vip_exclusive https://t.me/c/1234567890` or `@MyVipChannel`",
+            f"Usage: `/setcategorychannel <category_1-6> <channel_link_or_username>`\n\n"
+            f"📁 **Categories (1-6):**\n{help_text}\n\n"
+            f"Examples:\n"
+            f"• `/setcategorychannel 2 https://t.me/c/1234567890`\n"
+            f"• `/setcategorychannel 3 @MyVipChannel`",
             parse_mode="Markdown"
         )
         return
 
-    cat_key = context.args[0].lower()
-    if cat_key not in CATEGORIES:
-        cat_list = ", ".join(CATEGORIES.keys())
-        await update.message.reply_text(f"❌ Invalid category `{cat_key}`. Available: `{cat_list}`", parse_mode="Markdown")
+    cat_key = resolve_category(context.args[0])
+    if not cat_key:
+        help_text = get_categories_help_text()
+        await update.message.reply_text(
+            f"❌ Invalid category `{context.args[0]}`.\n\n"
+            f"Please choose a number (1-6):\n{help_text}",
+            parse_mode="Markdown"
+        )
         return
 
     channel = context.args[1]
@@ -1268,12 +1321,13 @@ async def category_channels_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         return
     settings = await get_category_channels_settings()
     lines = ["📁 **Categories & Linked Channels:**\n"]
-    for k, v in CATEGORIES.items():
+    for num, k in CATEGORY_NUM_MAP.items():
+        v = CATEGORIES[k]
         ch = settings.get(k) or "(No channel linked yet)"
         prem = "👑 Premium Only" if v["premium_only"] else "🆓 Free & Premium"
         cnt = await get_category_videos_count(k)
-        lines.append(f"• **{v['name']}** (`{k}`)\n  - Type: {prem}\n  - Channel: `{ch}`\n  - Videos: **{cnt}**\n")
-    lines.append("To update a channel: `/setcategorychannel <category> <channel>`")
+        lines.append(f"**{num}. {v['name']}** (`{k}`)\n  - Type: {prem}\n  - Channel: `{ch}`\n  - Videos: **{cnt}**\n")
+    lines.append("To update a channel: `/setcategorychannel <1-6> <channel>`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
