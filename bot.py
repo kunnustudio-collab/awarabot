@@ -5,6 +5,7 @@ import random
 import time
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus, urlparse
+from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorClient
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -47,6 +48,7 @@ db = mongo_client["telegram_bot"]
 users_collection = db["users"]
 videos_collection = db["videos"]
 settings_collection = db["settings"]
+submissions_collection = db["video_submissions"]
 
 # --- Categories Configuration ---
 CATEGORIES = {
@@ -633,6 +635,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         premium_status_text = get_premium_status_text(user_record)
         keyboard_buttons = [
             [InlineKeyboardButton("📁 𝐂𝐚𝐭𝐞𝐠𝐨𝐫𝐢𝐞𝐬", callback_data="categories")],
+            [InlineKeyboardButton("📤 𝐔𝐩𝐥𝐨𝐚𝐝 𝐕𝐢𝐝𝐞𝐨", callback_data="user_upload_prompt")],
             [InlineKeyboardButton("🧾 𝐇𝐞𝐥𝐩 / 𝐈𝐧𝐟𝐨", callback_data="help")],
             [
                 InlineKeyboardButton("📢 𝐂𝐡𝐚𝐧𝐧𝐞𝐥", url="https://t.me/+Nij4Wp7jbYY0YTFl"),
@@ -1759,6 +1762,290 @@ async def admin_save_video_callback(update: Update, context: ContextTypes.DEFAUL
         parse_mode="Markdown"
     )
 
+# --- User Video Submission & Admin Review Workflow ---
+async def user_upload_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    context.user_data["waiting_for_submission"] = True
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="start")]
+    ])
+
+    text = (
+        "📤 **Video Submission (User Upload)**\n\n"
+        "Aap is bot me apni video add karwane ke liye bhej sakte hain!\n\n"
+        "📌 **Kaise Kaam Karta Hai?**\n"
+        "1️⃣ Apni video yahan **send ya forward** karein.\n"
+        "2️⃣ Category select karein (Free Videos, Trending, etc.).\n"
+        "3️⃣ Video Admin ke review ke liye jayegi. Admin approve karega to turant bot me add ho jayegi!\n\n"
+        "⬇️ *Abhi apni video yahan send karein:*"
+    )
+    try:
+        if query.message:
+            await query.message.delete()
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+
+async def prompt_user_submit_video(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+    prompt_msg = await update.effective_message.reply_text("⏳ Processing video...")
+    mid = prompt_msg.message_id
+    context.user_data[f"usersub_{mid}"] = file_id
+
+    keyboard = []
+    row = []
+    for num, k in CATEGORY_NUM_MAP.items():
+        v = CATEGORIES[k]
+        row.append(InlineKeyboardButton(f"{num}. {v['name']}", callback_data=f"subcat_{k}_{mid}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"subcat_cancel_{mid}")])
+
+    await prompt_msg.edit_text(
+        "📹 **Video Mil Gayi!**\n\n"
+        "Aap is video ko kis category me submit karna chahte hain?\n"
+        "Niche di gayi category chunein:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def user_submit_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if "cancel" in data:
+        parts = data.split("_")
+        mid = parts[-1]
+        context.user_data.pop(f"usersub_{mid}", None)
+        await query.edit_message_text("❌ Video submission cancel kar diya gaya.")
+        return
+
+    parts = data.split("_")
+    mid = parts[-1]
+    cat_key = "_".join(parts[1:-1])
+
+    if cat_key not in CATEGORIES:
+        await query.edit_message_text("❌ Unknown category.")
+        return
+
+    file_id = context.user_data.pop(f"usersub_{mid}", None)
+    if not file_id:
+        await query.edit_message_text("⚠️ No pending video found or already submitted.")
+        return
+
+    user = query.from_user
+    cat_name = CATEGORIES[cat_key]["name"]
+
+    # Check if duplicate in main database
+    existing = await videos_collection.find_one({"file_id": file_id})
+    if existing:
+        await query.edit_message_text("ℹ️ Ye video pehle se hi bot database me exist karti hai. Thank you!")
+        return
+
+    # Save to submissions_collection
+    sub_doc = {
+        "user_id": user.id,
+        "user_name": user.full_name,
+        "username": user.username or "",
+        "file_id": file_id,
+        "category": cat_key,
+        "status": "pending",
+        "created_at": datetime.utcnow()
+    }
+    insert_res = await submissions_collection.insert_one(sub_doc)
+    sub_id = str(insert_res.inserted_id)
+
+    await query.edit_message_text(
+        f"✅ **Video Successfully Submitted for Review!**\n\n"
+        f"📁 **Selected Category:** {cat_name}\n"
+        f"⏳ **Status:** Pending Admin Approval\n\n"
+        f"Aapki video Admin ke paas review ke liye bhej di gayi hai. "
+        f"Jaise hi Admin verify karke approve karenge, video bot me live ho jayegi aur aapko alert mil jayega! ❤️",
+        parse_mode="Markdown"
+    )
+
+    # Send video + review buttons to ADMIN_ID
+    user_handle = f"@{user.username}" if user.username else "No username"
+    admin_caption = (
+        f"📩 **New User Video Submission!**\n\n"
+        f"👤 **From:** {user.full_name} ({user_handle})\n"
+        f"🆔 **User ID:** `{user.id}`\n"
+        f"📁 **Requested Category:** **{cat_name}** (`{cat_key}`)\n"
+        f"🕒 **Time:** {datetime.utcnow().strftime('%d %b %Y, %H:%M UTC')}\n\n"
+        f"👇 *Review and choose action:*"
+    )
+    admin_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Approve to {cat_name}", callback_data=f"mod_appr_{sub_id}_{cat_key}")],
+        [InlineKeyboardButton("🔀 Change Category & Approve", callback_data=f"mod_chgcat_{sub_id}")],
+        [InlineKeyboardButton("❌ Reject Video", callback_data=f"mod_rejc_{sub_id}")]
+    ])
+
+    try:
+        await context.bot.send_video(
+            chat_id=ADMIN_ID,
+            video=file_id,
+            caption=admin_caption,
+            parse_mode="Markdown",
+            reply_markup=admin_keyboard
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send video to admin, trying document: {e}")
+        try:
+            await context.bot.send_document(
+                chat_id=ADMIN_ID,
+                document=file_id,
+                caption=admin_caption,
+                parse_mode="Markdown",
+                reply_markup=admin_keyboard
+            )
+        except Exception as e2:
+            logger.error(f"Failed to send submission to admin: {e2}")
+
+async def admin_moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Access denied.", show_alert=True)
+        return
+    await query.answer()
+
+    data = query.data
+    # 1. Approve: mod_appr_<sub_id>_<cat_key>
+    if data.startswith("mod_appr_"):
+        parts = data.split("_")
+        sub_id = parts[2]
+        cat_key = "_".join(parts[3:])
+
+        try:
+            oid = ObjectId(sub_id)
+        except Exception:
+            await query.edit_message_caption(caption="❌ Invalid submission ID.")
+            return
+
+        sub_doc = await submissions_collection.find_one({"_id": oid})
+        if not sub_doc:
+            await query.edit_message_caption(caption="❌ Submission not found.")
+            return
+
+        if sub_doc.get("status") != "pending":
+            await query.edit_message_caption(caption=f"ℹ️ Already processed: **{sub_doc.get('status')}**.", parse_mode="Markdown")
+            return
+
+        file_id = sub_doc["file_id"]
+        cat_name = CATEGORIES.get(cat_key, {}).get("name", cat_key)
+
+        if await videos_collection.count_documents({"file_id": file_id}) == 0:
+            await videos_collection.insert_one({
+                "file_id": file_id,
+                "category": cat_key,
+                "submitted_by": sub_doc["user_id"],
+                "date_added": datetime.utcnow()
+            })
+            category_counts_cache[cat_key] = category_counts_cache.get(cat_key, 0) + 1
+
+        await submissions_collection.update_one(
+            {"_id": oid},
+            {"$set": {"status": "approved", "final_category": cat_key, "reviewed_at": datetime.utcnow()}}
+        )
+
+        total_cnt = category_counts_cache.get(cat_key, 0)
+        await query.edit_message_caption(
+            caption=(
+                f"✅ **Submission APPROVED!**\n\n"
+                f"📁 Added to: **{cat_name}** (`{cat_key}`)\n"
+                f"👤 Submitter: {sub_doc['user_name']} (`{sub_doc['user_id']}`)\n"
+                f"🎬 Total in Category: **{total_cnt}** videos"
+            ),
+            parse_mode="Markdown"
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=sub_doc["user_id"],
+                text=(
+                    f"🎉 **Video Approved!**\n\n"
+                    f"Aapki submit ki gayi video Admin dwara verify karke **{cat_name}** me add kar di gayi hai!\n"
+                    f"Thank you for sharing with our community! ❤️"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        return
+
+    # 2. Change Category: mod_chgcat_<sub_id>
+    if data.startswith("mod_chgcat_"):
+        sub_id = data.replace("mod_chgcat_", "")
+        keyboard = []
+        row = []
+        for num, k in CATEGORY_NUM_MAP.items():
+            v = CATEGORIES[k]
+            row.append(InlineKeyboardButton(f"{num}. {v['name']}", callback_data=f"mod_appr_{sub_id}_{k}"))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("❌ Reject Video", callback_data=f"mod_rejc_{sub_id}")])
+
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # 3. Reject: mod_rejc_<sub_id>
+    if data.startswith("mod_rejc_"):
+        sub_id = data.replace("mod_rejc_", "")
+        try:
+            oid = ObjectId(sub_id)
+        except Exception:
+            await query.edit_message_caption(caption="❌ Invalid submission ID.")
+            return
+
+        sub_doc = await submissions_collection.find_one({"_id": oid})
+        if not sub_doc:
+            await query.edit_message_caption(caption="❌ Submission not found.")
+            return
+
+        if sub_doc.get("status") != "pending":
+            await query.edit_message_caption(caption=f"ℹ️ Already processed: **{sub_doc.get('status')}**.", parse_mode="Markdown")
+            return
+
+        await submissions_collection.update_one(
+            {"_id": oid},
+            {"$set": {"status": "rejected", "reviewed_at": datetime.utcnow()}}
+        )
+
+        await query.edit_message_caption(
+            caption=(
+                f"❌ **Submission REJECTED.**\n\n"
+                f"👤 Submitter: {sub_doc['user_name']} (`{sub_doc['user_id']}`)\n"
+                f"Video discard kar di gayi aur bot me add nahi hui."
+            ),
+            parse_mode="Markdown"
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=sub_doc["user_id"],
+                text="ℹ️ **Submission Update:**\n\nAapki submit ki gayi video Admin review me approve nahi ho saki.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        return
+
 # --- Incoming Video Handler (Auto-Add Listener) ---
 async def auto_video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
@@ -1775,10 +2062,13 @@ async def auto_video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not file_id:
         return
 
-    # Check if direct message in PM from admin
+    # Check if direct message in PM
     if chat.type == "private":
-        if update.effective_user and update.effective_user.id == ADMIN_ID:
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id == ADMIN_ID:
             await prompt_admin_save_video(update, context, file_id)
+        else:
+            await prompt_user_submit_video(update, context, file_id)
         return
 
     # In groups/channels, check if auto-add is globally enabled
@@ -2175,6 +2465,9 @@ def build_application():
     application.add_handler(CallbackQueryHandler(rename_cancel_cb, pattern="^rename_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_command_info, pattern="^admin_.*$"))
     application.add_handler(CallbackQueryHandler(admin_save_video_callback, pattern="^savevid_.*$"))
+    application.add_handler(CallbackQueryHandler(user_upload_prompt, pattern="^user_upload_prompt$"))
+    application.add_handler(CallbackQueryHandler(user_submit_category_callback, pattern="^subcat_.*$"))
+    application.add_handler(CallbackQueryHandler(admin_moderation_callback, pattern="^mod_.*$"))
     application.add_handler(CallbackQueryHandler(category_video_handler, pattern="^(cat_.*|leakvideos)$"))
     application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, auto_video_handler))
     application.add_error_handler(error_handler)
