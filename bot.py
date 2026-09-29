@@ -11,7 +11,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes
+    MessageHandler, filters, ContextTypes
 )
 from telegram.error import Forbidden, BadRequest
 
@@ -176,6 +176,91 @@ add_all_state = {
 
 # Default behavior for /addall: run in background so normal bot use is not blocked.
 ADD_ALL_BACKGROUND_DEFAULT = True
+
+# --- Auto-Add System State & Cache ---
+auto_add_cache = {}  # identifier (chat_id str, @username str) -> category_key
+auto_add_enabled = True
+_auto_add_notify_state = {}
+
+async def _debounced_auto_add_notify(bot, cat_key):
+    await asyncio.sleep(2.5)
+    data = _auto_add_notify_state.pop(cat_key, None)
+    if not data or data.get("count", 0) <= 0:
+        return
+    count = data["count"]
+    chat_title = data.get("chat_title", "Group")
+    cat_name = CATEGORIES.get(cat_key, {}).get("name", cat_key)
+    total_cnt = category_counts_cache.get(cat_key, 0)
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"📥 **Auto-Add Video Alert**\n\n"
+                f"✅ **{count}** new video{'s' if count > 1 else ''} automatically saved!\n"
+                f"📁 Category: **{cat_name}** (`{cat_key}`)\n"
+                f"📺 Source: **{chat_title}**\n"
+                f"🎬 Total in Category: **{total_cnt}** videos"
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.warning(f"Could not send auto-add alert: {e}")
+
+def queue_auto_add_notification(app, cat_key, chat_title):
+    if cat_key not in _auto_add_notify_state:
+        _auto_add_notify_state[cat_key] = {"count": 1, "chat_title": chat_title}
+        app.create_task(_debounced_auto_add_notify(app.bot, cat_key))
+    else:
+        _auto_add_notify_state[cat_key]["count"] += 1
+        _auto_add_notify_state[cat_key]["chat_title"] = chat_title
+
+async def load_auto_add_settings():
+    global auto_add_cache, auto_add_enabled
+    new_cache = {}
+    try:
+        settings = await settings_collection.find_one({"_id": "auto_add_settings"})
+        if settings:
+            auto_add_enabled = settings.get("enabled", True)
+            channels = settings.get("channels", {})
+            for ident, cdata in channels.items():
+                cat = cdata if isinstance(cdata, str) else (cdata.get("category") if isinstance(cdata, dict) else None)
+                if cat in CATEGORIES:
+                    ident_str = str(ident).lower().strip()
+                    new_cache[ident_str] = cat
+                    if ident_str.startswith("@"):
+                        new_cache[ident_str[1:]] = cat
+                    else:
+                        new_cache[f"@{ident_str}"] = cat
+                    if isinstance(cdata, dict) and cdata.get("chat_id"):
+                        new_cache[str(cdata["chat_id"])] = cat
+
+        cat_channels = await settings_collection.find_one({"_id": "category_channels"})
+        if cat_channels:
+            for cat_key, ch in cat_channels.items():
+                if cat_key in CATEGORIES and ch:
+                    ch_str = str(ch).strip().lower()
+                    if ch_str.startswith("http"):
+                        parts = ch_str.rstrip("/").split("/")
+                        if "c" in parts:
+                            try:
+                                c_idx = parts.index("c")
+                                new_cache[f"-100{parts[c_idx+1]}"] = cat_key
+                            except Exception:
+                                pass
+                        elif len(parts) >= 1:
+                            u = parts[-1].lstrip("@")
+                            new_cache[u] = cat_key
+                            new_cache[f"@{u}"] = cat_key
+                    else:
+                        new_cache[ch_str] = cat_key
+                        if ch_str.startswith("@"):
+                            new_cache[ch_str[1:]] = cat_key
+                        else:
+                            new_cache[f"@{ch_str}"] = cat_key
+        auto_add_cache = new_cache
+        logger.info(f"Loaded {len(auto_add_cache)} identifiers into auto_add_cache. (Enabled: {auto_add_enabled})")
+    except Exception as e:
+        logger.warning(f"Error loading auto_add_settings: {e}")
 
 # --- Helper Functions ---
 async def add_user(user_id, full_name):
@@ -685,6 +770,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Video", callback_data="admin_add")],
+        [InlineKeyboardButton("⚡ Auto-Add Videos", callback_data="admin_autoadd")],
         [InlineKeyboardButton("📥 AddAll Videos", callback_data="admin_addall")],
         [InlineKeyboardButton("📁 Category Channels", callback_data="admin_catchannels")],
         [InlineKeyboardButton("🧹 Clean DB", callback_data="admin_clean")],
@@ -743,6 +829,7 @@ async def admin_command_info(update: Update, context: ContextTypes.DEFAULT_TYPE)
     cat_help = get_categories_help_text()
     command_text = {
         "admin_add": f"/add <message_link> [1-6]\n\n📁 Categories:\n{cat_help}\n\nExample: `/add https://t.me/c/123/42 2`",
+        "admin_autoadd": f"/autoadd (View status & groups)\n\n1. In Group: `/autoadd <1-6>` (e.g. `/autoadd 2`)\n2. In PM: `/autoadd <1-6> <channel_or_group>`\n3. Disable: `/autoadd off`\n\n📁 Categories:\n{cat_help}",
         "admin_addall": f"/addall <start_link> <end_id> [1-6] [bg|fg]\n\n📁 Categories:\n{cat_help}\n\nExample: `/addall https://t.me/c/123/1 50 2 bg`",
         "admin_catchannels": f"/categorychannels\nOr link channel:\n/setcategorychannel <1-6> <channel>\n\n📁 Categories:\n{cat_help}",
         "admin_clean": f"/clean [1-6] (or /clean for all categories)\n\n📁 Categories:\n{cat_help}",
@@ -1313,8 +1400,35 @@ async def set_category_channel_cmd(update: Update, context: ContextTypes.DEFAULT
         {"$set": {cat_key: channel}},
         upsert=True
     )
+
+    try:
+        clean_target = channel
+        if "t.me/" in channel:
+            ch_id, _ = parse_channel_link(channel + "/1")
+            if ch_id:
+                clean_target = ch_id
+        target_chat = await context.bot.get_chat(clean_target)
+        if target_chat:
+            await settings_collection.update_one(
+                {"_id": "auto_add_settings"},
+                {"$set": {f"channels.{target_chat.id}": {
+                    "category": cat_key,
+                    "title": target_chat.title or str(target_chat.id),
+                    "username": target_chat.username or "",
+                    "chat_id": target_chat.id
+                }}},
+                upsert=True
+            )
+    except Exception:
+        pass
+
+    await load_auto_add_settings()
     cat_name = CATEGORIES[cat_key]["name"]
-    await update.message.reply_text(f"✅ Channel for **{cat_name}** (`{cat_key}`) updated to: `{channel}`", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"✅ Channel for **{cat_name}** (`{cat_key}`) updated to: `{channel}`\n"
+        f"⚡ Auto-Add is also enabled for this channel!",
+        parse_mode="Markdown"
+    )
 
 async def category_channels_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
@@ -1329,6 +1443,368 @@ async def category_channels_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append(f"**{num}. {v['name']}** (`{k}`)\n  - Type: {prem}\n  - Channel: `{ch}`\n  - Videos: **{cnt}**\n")
     lines.append("To update a channel: `/setcategorychannel <1-6> <channel>`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def autoadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or user.id != ADMIN_ID:
+        return
+
+    chat = update.effective_chat
+    is_group_or_channel = chat.type in ("group", "supergroup", "channel")
+
+    # --- Mode 1: Executed inside a Group or Channel ---
+    if is_group_or_channel:
+        chat_id_str = str(chat.id)
+        if not context.args:
+            cur_cat = auto_add_cache.get(chat_id_str)
+            cur_text = f"**{CATEGORIES[cur_cat]['name']}** (`{cur_cat}`)" if cur_cat else "❌ *Not configured*"
+            help_text = get_categories_help_text()
+            await update.effective_message.reply_text(
+                f"⚙️ **Auto-Add Settings for this Chat:**\n\n"
+                f"📺 Chat: **{chat.title}** (`{chat.id}`)\n"
+                f"📁 Current Category: {cur_text}\n\n"
+                f"**To set auto-add for this chat:**\n"
+                f"`/autoadd <1-6>` (e.g. `/autoadd 2`)\n\n"
+                f"**To disable auto-add for this chat:**\n"
+                f"`/autoadd off`\n\n"
+                f"📁 **Categories (1-6):**\n{help_text}",
+                parse_mode="Markdown"
+            )
+            return
+
+        arg = context.args[0].lower()
+        if arg in ("off", "disable", "stop", "remove"):
+            await settings_collection.update_one(
+                {"_id": "auto_add_settings"},
+                {"$unset": {f"channels.{chat_id_str}": ""}}
+            )
+            if chat.username:
+                u = chat.username.lower()
+                await settings_collection.update_one(
+                    {"_id": "auto_add_settings"},
+                    {"$unset": {f"channels.@{u}": "", f"channels.{u}": ""}}
+                )
+            await load_auto_add_settings()
+            await update.effective_message.reply_text(f"🛑 Auto-Add disabled for **{chat.title}**.")
+            return
+
+        resolved = resolve_category(arg)
+        if not resolved:
+            help_text = get_categories_help_text()
+            await update.effective_message.reply_text(
+                f"❌ Invalid category `{arg}`.\n\n"
+                f"Please choose a number (1-6):\n{help_text}",
+                parse_mode="Markdown"
+            )
+            return
+
+        chat_data = {
+            "category": resolved,
+            "title": chat.title or "",
+            "username": chat.username or "",
+            "chat_id": chat.id,
+            "type": chat.type
+        }
+        set_dict = {
+            "enabled": True,
+            f"channels.{chat_id_str}": chat_data
+        }
+        if chat.username:
+            u = chat.username.lower()
+            set_dict[f"channels.@{u}"] = chat_data
+            set_dict[f"channels.{u}"] = chat_data
+
+        await settings_collection.update_one(
+            {"_id": "auto_add_settings"},
+            {"$set": set_dict},
+            upsert=True
+        )
+        await load_auto_add_settings()
+
+        cat_name = CATEGORIES[resolved]["name"]
+        await update.effective_message.reply_text(
+            f"✅ **Auto-Add Enabled for this Chat!**\n\n"
+            f"📺 Chat: **{chat.title}**\n"
+            f"📁 Target Category: **{cat_name}** (`{resolved}`)\n\n"
+            f"⚡ Jab bhi koi video is chat me post hogi, wo automatically bot database me add ho jayegi!",
+            parse_mode="Markdown"
+        )
+        return
+
+    # --- Mode 2: Executed in Private Chat (PM with Bot) ---
+    if not context.args:
+        settings = await settings_collection.find_one({"_id": "auto_add_settings"}) or {}
+        channels = settings.get("channels", {})
+        status_icon = "🟢 Enabled" if auto_add_enabled else "🔴 Disabled"
+
+        lines = [
+            f"⚙️ **Auto-Add Control Panel**\n",
+            f"Status: **{status_icon}**\n",
+            "📋 **Configured Auto-Add Sources:**"
+        ]
+
+        if not channels:
+            lines.append("_(No channels or groups linked yet)_")
+        else:
+            shown = set()
+            for ident, cdata in channels.items():
+                if isinstance(cdata, dict):
+                    cid = cdata.get("chat_id") or ident
+                    if cid in shown:
+                        continue
+                    shown.add(cid)
+                    title = cdata.get("title") or ident
+                    cat = cdata.get("category", "free_videos")
+                    cat_name = CATEGORIES.get(cat, {}).get("name", cat)
+                    lines.append(f"• **{title}** (`{ident}`) ➔ **{cat_name}**")
+                elif isinstance(cdata, str):
+                    if ident in shown:
+                        continue
+                    shown.add(ident)
+                    cat_name = CATEGORIES.get(cdata, {}).get("name", cdata)
+                    lines.append(f"• `{ident}` ➔ **{cat_name}**")
+
+        help_text = get_categories_help_text()
+        lines.append(
+            f"\n📖 **Kaise use karein:**\n"
+            f"1️⃣ **Group ke andar:** Group me jaakar `/autoadd <1-6>` run karein (e.g. `/autoadd 2`).\n"
+            f"2️⃣ **Yahan PM me:** `/autoadd <1-6> <channel_username_or_link>`\n"
+            f"   Example: `/autoadd 2 @MyViralGroup`\n"
+            f"3️⃣ **Band karne ke liye:** `/autoadd off`\n\n"
+            f"📁 **Categories (1-6):**\n{help_text}"
+        )
+        await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+
+    first_arg = context.args[0].lower()
+    if first_arg in ("on", "enable", "start"):
+        await settings_collection.update_one(
+            {"_id": "auto_add_settings"},
+            {"$set": {"enabled": True}},
+            upsert=True
+        )
+        await load_auto_add_settings()
+        await update.effective_message.reply_text("🟢 Auto-Add feature globally **Enabled**.")
+        return
+
+    if first_arg in ("off", "disable", "stop"):
+        if len(context.args) > 1:
+            target = context.args[1].lower().strip()
+            resolved = resolve_category(target)
+            if resolved:
+                settings = await settings_collection.find_one({"_id": "auto_add_settings"}) or {}
+                channels = settings.get("channels", {})
+                to_remove = [k for k, v in channels.items() if (isinstance(v, dict) and v.get("category") == resolved) or v == resolved]
+                if to_remove:
+                    unset_dict = {f"channels.{k}": "" for k in to_remove}
+                    await settings_collection.update_one({"_id": "auto_add_settings"}, {"$unset": unset_dict})
+                    await load_auto_add_settings()
+                    await update.effective_message.reply_text(f"🛑 Auto-Add removed for category **{CATEGORIES[resolved]['name']}**.")
+                    return
+            target_key = target.lstrip("@")
+            unset_dict = {f"channels.{target}": "", f"channels.@{target_key}": "", f"channels.{target_key}": ""}
+            await settings_collection.update_one({"_id": "auto_add_settings"}, {"$unset": unset_dict})
+            await load_auto_add_settings()
+            await update.effective_message.reply_text(f"🛑 Removed auto-add for `{target}`.")
+            return
+        else:
+            await settings_collection.update_one(
+                {"_id": "auto_add_settings"},
+                {"$set": {"enabled": False}},
+                upsert=True
+            )
+            await load_auto_add_settings()
+            await update.effective_message.reply_text("🔴 Auto-Add feature globally **Disabled**.")
+            return
+
+    resolved_cat = resolve_category(first_arg)
+    if not resolved_cat:
+        help_text = get_categories_help_text()
+        await update.effective_message.reply_text(
+            f"❌ Invalid category `{first_arg}`.\n\n"
+            f"Please choose a number (1-6):\n{help_text}",
+            parse_mode="Markdown"
+        )
+        return
+
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            f"Usage in PM: `/autoadd <1-6> <channel_link_or_username_or_id>`\n"
+            f"Example: `/autoadd 2 @MyViralGroup`",
+            parse_mode="Markdown"
+        )
+        return
+
+    raw_channel = context.args[1].strip()
+    target_ident = raw_channel
+    title = raw_channel
+    chat_id_val = None
+
+    try:
+        clean_target = raw_channel
+        if "t.me/" in raw_channel:
+            ch_id, _ = parse_channel_link(raw_channel + "/1")
+            if ch_id:
+                clean_target = ch_id
+        target_chat = await context.bot.get_chat(clean_target)
+        if target_chat:
+            chat_id_val = target_chat.id
+            title = target_chat.title or target_chat.username or str(target_chat.id)
+            target_ident = str(target_chat.id)
+    except Exception as e:
+        logger.info(f"Could not get_chat for {raw_channel}: {e}")
+
+    chat_data = {
+        "category": resolved_cat,
+        "title": title,
+        "username": raw_channel.lstrip("@"),
+        "chat_id": chat_id_val or raw_channel
+    }
+
+    set_dict = {
+        "enabled": True,
+        f"channels.{target_ident}": chat_data
+    }
+    if raw_channel.startswith("@") or not raw_channel.startswith("-100"):
+        u = raw_channel.lstrip("@").lower()
+        set_dict[f"channels.@{u}"] = chat_data
+        set_dict[f"channels.{u}"] = chat_data
+
+    await settings_collection.update_one(
+        {"_id": "auto_add_settings"},
+        {"$set": set_dict},
+        upsert=True
+    )
+    await load_auto_add_settings()
+
+    cat_name = CATEGORIES[resolved_cat]["name"]
+    await update.effective_message.reply_text(
+        f"✅ **Auto-Add Configured!**\n\n"
+        f"📺 Channel/Group: **{title}** (`{raw_channel}`)\n"
+        f"📁 Category: **{cat_name}** (`{resolved_cat}`)\n\n"
+        f"📌 *Note: Make sure the bot is an Administrator in that group/channel so it can receive messages!*",
+        parse_mode="Markdown"
+    )
+
+# --- Direct Video Upload by Admin in PM ---
+async def prompt_admin_save_video(update: Update, context: ContextTypes.DEFAULT_TYPE, file_id: str):
+    context.user_data["pending_video_file_id"] = file_id
+    keyboard = []
+    row = []
+    for num, k in CATEGORY_NUM_MAP.items():
+        v = CATEGORIES[k]
+        row.append(InlineKeyboardButton(f"{num}. {v['name']}", callback_data=f"savevid_{k}"))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="savevid_cancel")])
+
+    await update.effective_message.reply_text(
+        "📹 **New Video Received!**\n\n"
+        "Choose a category to save this video:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_save_video_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        await query.answer("Access denied.", show_alert=True)
+        return
+    await query.answer()
+
+    data = query.data
+    if data == "savevid_cancel":
+        context.user_data.pop("pending_video_file_id", None)
+        await query.edit_message_text("❌ Video saving cancelled.")
+        return
+
+    cat_key = data.replace("savevid_", "")
+    if cat_key not in CATEGORIES:
+        await query.edit_message_text("❌ Unknown category.")
+        return
+
+    file_id = context.user_data.pop("pending_video_file_id", None)
+    if not file_id:
+        await query.edit_message_text("⚠️ No pending video found. Please send the video again.")
+        return
+
+    existing = await videos_collection.find_one({"file_id": file_id})
+    cat_name = CATEGORIES[cat_key]["name"]
+    if existing:
+        await query.edit_message_text(f"ℹ️ Video is already in database (Category: **{existing.get('category', 'unknown')}**).", parse_mode="Markdown")
+        return
+
+    await videos_collection.insert_one({
+        "file_id": file_id,
+        "category": cat_key,
+        "date_added": datetime.utcnow()
+    })
+    category_counts_cache[cat_key] = category_counts_cache.get(cat_key, 0) + 1
+    total = category_counts_cache[cat_key]
+
+    await query.edit_message_text(
+        f"✅ Video Saved to **{cat_name}** (`{cat_key}`)!\n\n"
+        f"🎬 Total in {cat_name}: **{total}** videos",
+        parse_mode="Markdown"
+    )
+
+# --- Incoming Video Handler (Auto-Add Listener) ---
+async def auto_video_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+
+    file_id = None
+    if msg.video:
+        file_id = msg.video.file_id
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("video/"):
+        file_id = msg.document.file_id
+
+    if not file_id:
+        return
+
+    # Check if direct message in PM from admin
+    if chat.type == "private":
+        if update.effective_user and update.effective_user.id == ADMIN_ID:
+            await prompt_admin_save_video(update, context, file_id)
+        return
+
+    # In groups/channels, check if auto-add is globally enabled
+    if not auto_add_enabled:
+        return
+
+    chat_id_str = str(chat.id)
+    chat_user = chat.username.lower() if chat.username else None
+
+    # Match chat in auto_add_cache
+    cat_key = auto_add_cache.get(chat_id_str)
+    if not cat_key and chat_user:
+        cat_key = auto_add_cache.get(chat_user) or auto_add_cache.get(f"@{chat_user}")
+
+    if not cat_key:
+        return
+
+    # Check if video is already in database
+    existing = await videos_collection.find_one({"file_id": file_id})
+    if existing:
+        return
+
+    # Insert video into database
+    await videos_collection.insert_one({
+        "file_id": file_id,
+        "category": cat_key,
+        "source_chat_id": chat.id,
+        "source_message_id": msg.message_id,
+        "date_added": datetime.utcnow()
+    })
+
+    category_counts_cache[cat_key] = category_counts_cache.get(cat_key, 0) + 1
+
+    chat_title = chat.title or (f"@{chat.username}" if chat.username else f"Chat {chat.id}")
+    queue_auto_add_notification(context.application, cat_key, chat_title)
 
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
@@ -1653,6 +2129,7 @@ def start_polling_dummy_server(port):
     return server
 
 async def on_startup(application):
+    await load_auto_add_settings()
     application.create_task(send_startup_log(application.bot))
     base_url = os.environ.get("WEBHOOK_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
     if base_url:
@@ -1676,6 +2153,7 @@ def build_application():
     application.add_handler(CommandHandler("renamechannel", renamechannel_cmd))
     application.add_handler(CommandHandler("categorychannels", category_channels_cmd))
     application.add_handler(CommandHandler("setcategorychannel", set_category_channel_cmd))
+    application.add_handler(CommandHandler("autoadd", autoadd_cmd))
     
     application.add_handler(CallbackQueryHandler(check_joined, pattern="^check_joined$"))
     application.add_handler(CallbackQueryHandler(categories_menu, pattern="^categories$"))
@@ -1687,7 +2165,9 @@ def build_application():
     application.add_handler(CallbackQueryHandler(rename_confirm_cb, pattern="^rename_confirm$"))
     application.add_handler(CallbackQueryHandler(rename_cancel_cb, pattern="^rename_cancel$"))
     application.add_handler(CallbackQueryHandler(admin_command_info, pattern="^admin_.*$"))
+    application.add_handler(CallbackQueryHandler(admin_save_video_callback, pattern="^savevid_.*$"))
     application.add_handler(CallbackQueryHandler(category_video_handler, pattern="^(cat_.*|leakvideos)$"))
+    application.add_handler(MessageHandler(filters.VIDEO | filters.Document.ALL, auto_video_handler))
     application.add_error_handler(error_handler)
 
     return application
