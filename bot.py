@@ -28,7 +28,7 @@ FORCE_CHANNELS = [
     "@AwaraTeams",
     "@AwaraWorld"
 ]
-FREE_VIDEOS_PER_DAY = 20
+FREE_VIDEOS_PER_DAY = 10
 BUY_PREMIUM_URL = "https://t.me/MeAwara"
 
 # --- Logging ---
@@ -59,7 +59,7 @@ CATEGORIES = {
         "default_channel": "@AwaraZone0"
     },
     "trending_viral": {
-        "name": "🚀 𝐓𝐫𝐞𝐧𝐝𝐢𝐧𝐠 𝐕𝐢𝐫𝐚𝐥",
+        "name": "🚀 demo",
         "premium_only": True,
         "default_channel": ""
     },
