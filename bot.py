@@ -59,12 +59,12 @@ CATEGORIES = {
         "default_channel": "@AwaraZone0"
     },
     "trending_viral": {
-        "name": "🚀 demo",
+        "name": "🚀 𝐂𝐏 𝐕𝐢𝐝𝐞𝐨𝐬",
         "premium_only": True,
         "default_channel": ""
     },
     "vip_exclusive": {
-        "name": "👑 𝐕𝐈𝐏 𝐄𝐱𝐜𝐥𝐮𝐬𝐢𝐯𝐞",
+        "name": "🥵 𝐑𝐚𝐩𝐞 𝐕𝐢𝐝𝐞𝐨𝐬",
         "premium_only": True,
         "default_channel": ""
     },
@@ -74,12 +74,12 @@ CATEGORIES = {
         "default_channel": ""
     },
     "trending_hot": {
-        "name": "⚡ 𝐓𝐫𝐞𝐧𝐝𝐢𝐧𝐠 𝐇𝐨𝐭",
+        "name": "⚡ 𝐃𝐚𝐝 𝐀𝐧𝐝 𝐃𝐚𝐮𝐠𝐡𝐭𝐞𝐫",
         "premium_only": True,
         "default_channel": ""
     },
     "international": {
-        "name": "💃 𝐈𝐧𝐭𝐞𝐫𝐧𝐚𝐭𝐢𝐨𝐧𝐚𝐥",
+        "name": "💃 𝐌𝐨𝐦 𝐀𝐧𝐝 𝐒𝐨𝐧",
         "premium_only": True,
         "default_channel": ""
     }
